@@ -3,29 +3,157 @@
 Split into ModelConfig / CacheConfig / SchedulerConfig so that the CPU-side
 scheduler stack (`cascade.core`) depends only on the pieces it needs — this
 keeps the scheduler testable on Windows without a GPU or torch.cuda.
+
+`ModelConfig.from_hf_dict` parses a HuggingFace `config.json` for the
+DeepSeek-V2 family (V2 / V2-Lite / V2.5; V3 parsing extends this in
+`model_executor/models/deepseek_v3.py` later).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+_MLA_NUM_KV_HEADS = 1  # MLA latent KV: single shared KV stream (MQA-like)
+
 
 @dataclass
 class ModelConfig:
-    """Model-side metadata the scheduler and cache need to know about."""
+    """Model-side metadata the scheduler, cache, and model layers need."""
 
-    max_model_len: int = 4096
-    vocab_size: int = 128256  # DeepSeek V2 family vocabulary
-    num_layers: int = 1  # KV-cache depth (Phase 1 mock models use 1)
-    num_kv_heads: int = 1  # MLA: single latent KV (MQA-like)
-    kv_lora_rank: int = 512  # MLA latent dim
-    qk_rope_head_dim: int = 64  # rope part appended to the latent
-    num_nextn_predict_layers: int = 0  # >0 → MTP draft weights exist
+    # --- 基础 ---
+    model_type: str = "deepseek_v2"
+    max_model_len: int = 4096  # max_position_embeddings
+    vocab_size: int = 128256  # DeepSeek V3 家族; V2-Lite 以 HF 配置为准
+    num_layers: int = 1  # num_hidden_layers
+    hidden_size: int = 2048
+    rms_norm_eps: float = 1e-6
+    rope_theta: float = 10000.0
+    tie_word_embeddings: bool = False
+
+    # --- MLA 注意力 ---
+    num_attention_heads: int = 16
+    q_lora_rank: int = 1024
+    kv_lora_rank: int = 512
+    qk_rope_head_dim: int = 64
+    qk_nope_head_dim: int = 128
+    v_head_dim: int = 128
+    num_kv_heads: int = _MLA_NUM_KV_HEADS
+
+    # --- dense FFN（前 first_k_dense_replace 层）---
+    intermediate_size: int = 2048
+
+    # --- MoE ---
+    moe_intermediate_size: int = 1408
+    first_k_dense_replace: int = 1
+    n_routed_experts: int = 64
+    n_shared_experts: int = 2
+    num_experts_per_tok: int = 6
+    routed_scaling_factor: float = 1.0
+    scoring_func: str = "sigmoid"  # V2/V2.5/V3 家族; "softmax" 为旧 V2 首版
+    topk_method: str = "noaux_tc"  # noaux_tc | greedy | ...
+    norm_topk_prob: bool = False
+
+    # --- MTP（V2 无; V3 = 1 层 nextn）---
+    num_nextn_predict_layers: int = 0
+
+    # ------------------------------------------------------------------ derived
 
     @property
     def kv_cache_dim(self) -> int:
-        """Tokens in the paged KV occupy `kv_lora_rank + qk_rope_head_dim` per layer."""
+        """分页 KV 中每个 token 每层占 `kv_lora_rank + qk_rope_head_dim`（c‖rope）。"""
         return self.kv_lora_rank + self.qk_rope_head_dim
+
+    @property
+    def qk_head_dim(self) -> int:
+        """softmax scale = 1/sqrt(qk_nope + qk_rope)（DeepSeek V2 语义）。"""
+        return self.qk_nope_head_dim + self.qk_rope_head_dim
+
+    @property
+    def softmax_scale(self) -> float:
+        return self.qk_head_dim**-0.5
+
+    @property
+    def num_dense_layers(self) -> int:
+        return min(self.first_k_dense_replace, self.num_layers)
+
+    @property
+    def num_moe_layers(self) -> int:
+        return self.num_layers - self.num_dense_layers
+
+    @property
+    def has_e_score_correction_bias(self) -> bool:
+        return self.topk_method == "noaux_tc"
+
+    @property
+    def shared_intermediate_size(self) -> int:
+        """共享专家拼接为单个宽 FFN：n_shared × moe_inter（DeepSeek V2 语义）。"""
+        return self.n_shared_experts * self.moe_intermediate_size
+
+    @property
+    def has_mtp(self) -> bool:
+        return self.num_nextn_predict_layers > 0
+
+    # ------------------------------------------------------------------ HF parsing
+
+    @classmethod
+    def from_hf_dict(cls, d: dict) -> ModelConfig:
+        """从 HF config.json（deepseek_v2 / deepseek_v3 家族）构建。
+
+        只读取字段、给默认值、做硬校验；不做任何架构推断（那是模型层的事）。
+        V3 特有字段（quantization_config、rope beta 缩放）留给
+        `deepseek_v3.py` 的扩展解析。
+        """
+        model_type = d.get("model_type", "deepseek_v2")
+        if model_type not in ("deepseek_v2", "deepseek_v3"):
+            raise ValueError(f"unsupported model_type {model_type!r} (仅支持 deepseek_v2/v3 家族)")
+        cfg = cls(
+            model_type=model_type,
+            max_model_len=int(d.get("max_position_embeddings", 4096)),
+            vocab_size=int(d["vocab_size"]),
+            num_layers=int(d["num_hidden_layers"]),
+            hidden_size=int(d["hidden_size"]),
+            rms_norm_eps=float(d.get("rms_norm_eps", 1e-6)),
+            rope_theta=float(d.get("rope_theta", 10000.0)),
+            tie_word_embeddings=bool(d.get("tie_word_embeddings", False)),
+            num_attention_heads=int(d["num_attention_heads"]),
+            q_lora_rank=int(d.get("q_lora_rank", 0)),
+            kv_lora_rank=int(d["kv_lora_rank"]),
+            qk_rope_head_dim=int(d["qk_rope_head_dim"]),
+            qk_nope_head_dim=int(d["qk_nope_head_dim"]),
+            v_head_dim=int(d["v_head_dim"]),
+            num_kv_heads=int(d.get("num_key_value_heads", _MLA_NUM_KV_HEADS)),
+            intermediate_size=int(d.get("intermediate_size", 2048)),
+            moe_intermediate_size=int(d.get("moe_intermediate_size", 2048)),
+            first_k_dense_replace=int(d.get("first_k_dense_replace", 0)),
+            n_routed_experts=int(d.get("n_routed_experts", 0)),
+            n_shared_experts=int(d.get("n_shared_experts", 0)),
+            num_experts_per_tok=int(d.get("num_experts_per_tok", 0)),
+            routed_scaling_factor=float(d.get("routed_scaling_factor", 1.0)),
+            scoring_func=d.get("scoring_func", "sigmoid"),
+            topk_method=d.get("topk_method", "greedy"),
+            norm_topk_prob=bool(d.get("norm_topk_prob", False)),
+            num_nextn_predict_layers=int(d.get("num_nextn_predict_layers", 0)),
+        )
+        cfg.validate()
+        return cfg
+
+    def validate(self) -> None:
+        assert self.num_layers > 0
+        assert self.hidden_size > 0
+        assert self.vocab_size > 0
+        assert self.num_attention_heads > 0
+        assert self.qk_nope_head_dim > 0 and self.qk_rope_head_dim > 0 and self.v_head_dim > 0
+        assert self.kv_lora_rank > 0
+        # 我们的 KV 布局假设 latent 单流（MLA MQA 语义）
+        assert self.num_kv_heads == 1, f"MLA latent KV 要求 num_key_value_heads=1, got {self.num_kv_heads}"
+        assert self.qk_rope_head_dim % 2 == 0, "rope head dim 必须为偶数"
+        assert 0 <= self.first_k_dense_replace <= self.num_layers
+        assert self.n_routed_experts >= 0
+        assert self.num_experts_per_tok >= 1
+        if self.n_routed_experts:
+            assert self.num_experts_per_tok <= self.n_routed_experts
+        assert self.scoring_func in ("sigmoid", "softmax"), f"不支持的 scoring_func {self.scoring_func}"
+        assert self.routed_scaling_factor > 0
 
 
 @dataclass
@@ -70,9 +198,10 @@ class EngineConfig:
     runtime_max_model_len: int = 0
 
     def validate(self) -> None:
+        self.model.validate()
         self.cache.validate()
         self.scheduler.validate()
         # 位置余量：投机解码需要 max_model_len 之外再容纳 K+1 个回退位置
         # (DeepInfer: runtime_max_model_len = max_model_len + 2*nextn + 1)。
-        nextn = 0  # Phase 1: 无 MTP；Phase 5 起由 num_nextn_predict_layers 决定
+        nextn = self.model.num_nextn_predict_layers
         self.runtime_max_model_len = self.model.max_model_len + 2 * nextn + 1
