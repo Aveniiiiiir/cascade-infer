@@ -5,20 +5,29 @@ Semantics mirror DeepInfer's `csrc/engine/scheduler.hpp` where applicable:
 - Three queues: ``waiting`` (prompt 未算完/待重算) → ``running`` (decode)。
   DeepInfer has an intermediate ``prompted`` queue for prefill-completed
   sequences; we fold it into the waiting→running transition instead.
-- Prefill: FCFS from waiting, budget-capped; over-budget prompts are chunked
-  (截断留队头), at most ONE chunked sequence per step (DeepInfer :543)。
+- Prefill: FCFS from waiting, budget-capped. **Multiple whole prompts are
+  packed into one step** (bounded by max_num_batched_tokens / sum-K /
+  max_num_seqs); an over-budget prompt is chunked (截断留队头) and at most
+  ONE chunked sequence runs per step (DeepInfer :543 breaks only on the
+  chunked case too).
 - Decode: LCFS — schedule newest first (ascending output_len); preemption
-  targets the longest-output sequence first (DeepInfer: 抢占队头)。
+  targets the longest-output sequence first (DeepInfer: 抢占队头).
 - Preemption: RECOMPUTE mode resets the sequence for recomputation (cheap
   with prefix caching — its blocks stay in the cache); STOP mode finishes it.
   Structured-output sequences cannot be recomputed → preemption kills them.
+- **Never-fit guard**: a sequence whose KV footprint can never fit the pool
+  finishes as FINISHED_IGNORED (DeepInfer's NEVER path, scheduler.hpp:389) —
+  the engine must not livelock on unsatisfiable growth.
+- Prefix matching clamps the hit so at least one token is always computed
+  fresh (vLLM V1 / DeepInfer fork clamp `set_num_tokens(min(..., len-1))`):
+  a fully-cached sequence would otherwise produce a 0-token prefill row.
 - **Optimistic advancement**: `num_tokens_computed` is advanced at *schedule*
   time, before the step executes — the same one-step-lag protocol DeepInfer's
   ZOS builds on, here in its trivially-consistent synchronous form. Phase 4
   (ZOS) keeps this protocol and only shifts *when* update_from_output runs.
 
-Divergence from DeepInfer (documented): we mix decode tokens and one prefill
-chunk in a single varlen batch (vLLM V1 style) instead of alternating
+Divergence from DeepInfer (documented): we mix decode tokens and prefill
+chunks in a single varlen batch (vLLM V1 style) instead of alternating
 whole-engine prefill/decode step types. DeepInfer's step-type separation
 serves DP consensus voting and EPD disaggregation, both Phase 6+ concerns.
 """
@@ -130,7 +139,12 @@ class Scheduler:
 
     @property
     def has_unfinished_requests(self) -> bool:
-        return bool(self.waiting) or bool(self.running)
+        """含 schedule→update 窗口内"队列外悬空"的 seq（完成 prefill 待提交者）。"""
+        if self.waiting or self.running:
+            return True
+        if self._last_output is not None:
+            return any(not s.seq.is_finished for s in self._last_output.scheduled)
+        return False
 
     def abort(self, request_id: str) -> bool:
         seq = self._find(request_id)
@@ -142,11 +156,15 @@ class Scheduler:
     # ------------------------------------------------------------------ schedule
 
     def schedule(self) -> SchedulerOutput:
-        """调度一步：decode 行优先（延迟敏感），再用剩余预算排一个 prefill chunk。
+        """调度一步：decode 行优先（延迟敏感），再用剩余预算排 prefill。
 
         乐观推进：本函数内即推进 num_tokens_computed 并分配 KV 块；
         update_from_output 在执行结果返回后做提交（追加 token/判停）。
         """
+        assert self._last_output is None, (
+            "schedule() 被重入：上一步的 update_from_output 尚未调用 "
+            "（乐观推进会被覆盖导致状态腐蚀；ZOS Phase 4 将改为待提交队列）"
+        )
         out = SchedulerOutput(step_id=self._step + 1)
         self._preempted_this_step = set()
 
@@ -162,6 +180,16 @@ class Scheduler:
                 continue  # 排序副本中的已抢占/已结束 seq
             ok = self._acquire_kv(seq, num_new_tokens=1, out=out)
             if not ok:
+                # 永不满足：自身足迹已超池（自抢占排除自身 → 无候选可抢）。
+                # DeepInfer NEVER 路径：判 FINISHED_IGNORED 而非活锁空转。
+                if seq.num_blocks_for(seq.num_tokens, self.block_size) > self.block_mgr.num_blocks:
+                    _log.warning(
+                        "request %s: KV footprint %d blocks exceeds pool %d → FINISHED_IGNORED",
+                        seq.request_id,
+                        seq.num_blocks_for(seq.num_tokens, self.block_size),
+                        self.block_mgr.num_blocks,
+                    )
+                    self._finish_sequence(seq, SequenceStatus.FINISHED_IGNORED)
                 continue
             out.scheduled.append(ScheduledSeq(seq, 1, is_prefill=False))
             seq.num_tokens_computed += 1
@@ -169,20 +197,28 @@ class Scheduler:
             out.num_decode_seqs += 1
             budget -= 1
 
-        # ---- prefill（FCFS + chunked；一步最多一个 chunked seq）----
+        # ---- prefill（FCFS；多个完整 prompt 可打包进同一步，sum-K/max_seqs 封顶；
+        #       超预算者 chunk 化，一步至多一个 chunked seq —— DeepInfer :543 只在
+        #       chunked 情形 break，完整 prompt 继续装）----
         chunked_seen = False
         while self.waiting and budget > 0 and len(out.scheduled) < max_seqs and not chunked_seen:
             seq = self.waiting.popleft()
-            if seq.is_finished:  # abort 的 seq 残留在 waiting
+            if seq.is_finished:  # abort/ignore 的 seq 残留在 waiting
                 continue
             if seq.request_id in self._preempted_this_step:
                 # 本步被抢占重排进 waiting 的 seq：留待下一步
                 self.waiting.appendleft(seq)
                 break
             # 前缀匹配先于 chunk 计算：命中会推进 computed（命中部分 KV 已存在），
-            # chunk 只需覆盖剩余部分 —— 顺序颠倒会造成命中长度双重计数
+            # chunk 只需覆盖剩余部分 —— 顺序颠倒会造成命中长度双重计数。
+            # 匹配结果 clamp 到至少留 1 个新 token（全量命中会产生 0-token 行，
+            # 执行器无法从中采样 —— vLLM V1 / DeepInfer fork clamp 同语义）。
             self._try_match(seq)
             remaining = seq.num_tokens - seq.num_tokens_computed
+            assert remaining >= 1, (
+                f"{seq.request_id}: 非法的调度状态 computed={seq.num_tokens_computed} "
+                f"num_tokens={seq.num_tokens}（fork/回滚状态腐蚀）"
+            )
             chunk = min(remaining, budget)
             if out.scheduled and sum_seqlen_k + seq.num_tokens > self.cfg.scheduler.prefill_sum_seqlen_k:
                 # sum-K 预算（DeepInfer prefill_max_sum_seqlen_k）：放不下就留队头
@@ -191,8 +227,17 @@ class Scheduler:
             completes = chunk >= remaining
             ok = self._acquire_kv(seq, num_new_tokens=chunk, out=out)
             if not ok:
+                # 永不满足：重算后的完整足迹超池（prompt 之外还要装回已生成输出）
+                if seq.num_blocks_for(seq.num_tokens, self.block_size) > self.block_mgr.num_blocks:
+                    self._rollback_match(seq, out)
+                    _log.warning(
+                        "request %s: recompute footprint exceeds pool → FINISHED_IGNORED",
+                        seq.request_id,
+                    )
+                    self._finish_sequence(seq, SequenceStatus.FINISHED_IGNORED)
+                    continue
                 # 分配失败（含抢占后仍不足）：回滚匹配、放回队头
-                self._rollback_match(seq)
+                self._rollback_match(seq, out)
                 self.waiting.appendleft(seq)
                 chunked_seen = True  # 避免同一步反复尝试
                 continue
@@ -202,10 +247,11 @@ class Scheduler:
             budget -= chunk
             sum_seqlen_k += seq.num_tokens
             if completes:
-                # 末 chunk：seq 暂存于 scheduled，update 时 waiting→running
-                chunked_seen = True  # 一步只完成一个 prefill 收尾（对齐 DeepInfer）
+                # 末 chunk：seq 暂存于 scheduled，update 时 waiting→running；
+                # 继续尝试打包下一个完整 prompt（budget 允许时）
+                pass
             else:
-                self.waiting.appendleft(seq)  # chunked：留队头
+                self.waiting.appendleft(seq)  # chunked：留队头，本步不再收第二个 chunked
                 chunked_seen = True
 
         assert out.total_new_tokens == sum(s.num_new_tokens for s in out.scheduled)
@@ -219,6 +265,9 @@ class Scheduler:
     def update_from_output(self, sampled: dict[str, list[int]]) -> list[RequestOutput]:
         """提交一步的采样结果（ZOS Phase 4 起，本函数将滞后一步调用）。
 
+        窗口内被 abort/判死的 seq 直接跳过（DeepInfer process_outputs :906
+        对 finished 跳过，不靠 assert）——其块已在 _finish_sequence 释放。
+
         Args:
             sampled: request_id → 新采样 token 列表。prefill 中间 chunk 无条目；
                 末 chunk 与 decode 各产出 1 个 token（Phase 5 MTP 起可为多个）。
@@ -230,6 +279,8 @@ class Scheduler:
             return outputs
         for scheduled in last.scheduled:
             seq = scheduled.seq
+            if seq.is_finished:
+                continue  # 窗口内被 abort/抢占判死：丢弃本步采样，不追加
             new_tokens = sampled.get(seq.request_id, [])
             if scheduled.is_prefill and not scheduled.completes_prefill:
                 assert not new_tokens, f"{seq.request_id}: 中间 chunk 不应产出 token"
@@ -273,27 +324,43 @@ class Scheduler:
 
         前缀匹配由调用方（prefill 循环）在计算 chunk 之前完成；
         decode 序列的 computed 恒为 num_tokens-1，无需匹配。
-        含：COW（共享半写块）、逐出/抢占重试。
+        顺序（审查 #6 修复）：容量检查（含 COW 余量）→ COW 克隆 → 追加分配；
+        COW 使用 try_allocate，任何失败都不留半途状态。
         Returns: 是否成功（失败时 seq 状态不变）。
         """
         target = seq.num_blocks_for(seq.num_tokens_computed + num_new_tokens, self.block_size)
-        # COW：半写尾块被共享（fork 场景）→ 克隆后再写
-        self._maybe_cow(seq, out)
         have = len(seq.block_table)
         need = target - have
         assert need >= 0, f"{seq.request_id}: block table {have} 超过目标 {target}"
-        if need == 0:
+        cow_needed = self._cow_needed(seq)
+        if need == 0 and not cow_needed:
             return True
         # 抢占候选排除：本步已调度的 seq + 当前 seq 自身
         exclude = frozenset(s.seq.request_id for s in out.scheduled) | {seq.request_id}
-        if not self._ensure_capacity(need, exclude):
+        if not self._ensure_capacity(need + (1 if cow_needed else 0), exclude):
             return False
+        if cow_needed:
+            new_block = self.block_mgr.try_allocate()
+            if new_block is None:  # pragma: no cover - 容量已确保
+                return False
+            old_block = seq.block_table[-1]
+            seq.block_table[-1] = new_block
+            self.block_mgr.release(old_block)
+            out.cow_copies.append((new_block, old_block))
+        if need == 0:
+            return True
         try:
             for _ in range(need):
                 seq.block_table.append(self.block_mgr.allocate())
-        except BlockAllocationError:  # pragma: no cover - _ensure_capacity 已保证
+        except BlockAllocationError:  # pragma: no cover - 容量已确保
             return False
         return True
+
+    def _cow_needed(self, seq: Sequence) -> bool:
+        """半写尾块被共享（fork 前缀共享）时需要先克隆再写。"""
+        if not seq.block_table or seq.num_tokens_computed % self.block_size == 0:
+            return False
+        return self.block_mgr.ref_count(seq.block_table[-1]) > 1
 
     def _ensure_capacity(self, need: int, exclude: frozenset[str]) -> bool:
         """确保 can allocate `need` blocks：先逐出缓存，再抢占 running。"""
@@ -327,34 +394,40 @@ class Scheduler:
         hit_blocks, hit_tokens = self.prefix_cache.match(all_tokens)
         if not hit_blocks:
             return False
+        # clamp：至少留 1 个新 token（全量命中 → 0-token prefill 行是执行器
+        # 契约破裂；同 vLLM V1 与 DeepInfer fork clamp min(computed, len-1)）
+        max_blocks = max(0, (seq.num_tokens - 1) // self.block_size)
+        if len(hit_blocks) > max_blocks:
+            for block_id in hit_blocks[max_blocks:]:
+                self.block_mgr.release(block_id)
+            hit_blocks = hit_blocks[:max_blocks]
+            hit_tokens = len(hit_blocks) * self.block_size
+        if not hit_blocks:
+            return False
         seq.block_table = hit_blocks
         seq.num_cached_tokens = hit_tokens
         seq.num_tokens_computed = hit_tokens  # 命中部分 KV 已存在
         return True
 
-    def _rollback_match(self, seq: Sequence) -> None:
-        """分配失败时回滚前缀匹配（释放 pin，恢复未匹配状态）。"""
+    def _rollback_match(self, seq: Sequence, out: SchedulerOutput) -> None:
+        """分配失败时回滚本步对 seq 的全部变更（匹配 pin + COW 克隆）。"""
+        # COW 回滚：换回旧块、回收新块、撤销执行器拷贝计划
+        #（每 seq 每步至多一次 COW：只有半写尾块会被克隆）
+        for i in range(len(out.cow_copies) - 1, -1, -1):
+            new_block, old_block = out.cow_copies[i]
+            if new_block in seq.block_table:
+                idx = seq.block_table.index(new_block)
+                seq.block_table[idx] = old_block
+                self.block_mgr.retain(old_block)
+                self.block_mgr.release(new_block)
+                out.cow_copies.pop(i)
+                break
         if seq.block_table and seq.num_cached_tokens > 0:
             for block_id in seq.block_table:
                 self.block_mgr.release(block_id)
             seq.block_table = []
             seq.num_cached_tokens = 0
             seq.num_tokens_computed = 0
-
-    def _maybe_cow(self, seq: Sequence, out: SchedulerOutput) -> None:
-        """写共享半写块前先克隆（fork 前缀共享）。CPU 阶段只记账，GPU 侧
-        由执行器消费 out.cow_copies 做 KV 拷贝。"""
-        if not seq.block_table:
-            return
-        last = seq.block_table[-1]
-        if (
-            seq.num_tokens_computed % self.block_size != 0
-            and self.block_mgr.ref_count(last) > 1
-        ):
-            new_block = self.block_mgr.allocate()
-            seq.block_table[-1] = new_block
-            self.block_mgr.release(last)
-            out.cow_copies.append((new_block, last))
 
     def _register_full_blocks(self, seq: Sequence) -> None:
         """把序列中新变满的块注册进前缀缓存（已有注册的跳过）。"""
@@ -394,7 +467,7 @@ class Scheduler:
     def _finish_sequence(self, seq: Sequence, status: SequenceStatus) -> None:
         seq.finish(status)
         self._release_and_remove(seq)
-        # FINISHED_* 的最终输出（STOP 抢占 / abort）
+        # FINISHED_* 的最终输出（STOP 抢占 / abort / ignored）
         self._pending_outputs.append(
             RequestOutput(
                 request_id=seq.request_id,
@@ -434,6 +507,11 @@ class Scheduler:
         for seq in list(self.waiting) + self.running:
             if seq.request_id == request_id:
                 return seq
+        # schedule→update 窗口内的"队列外悬空"seq（完成 prefill 待提交者）
+        if self._last_output is not None:
+            for s in self._last_output.scheduled:
+                if s.seq.request_id == request_id:
+                    return s.seq
         return None
 
     def _trace_line(self, out: SchedulerOutput) -> str:

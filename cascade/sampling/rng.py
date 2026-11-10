@@ -106,6 +106,8 @@ def _urshift(x, n: int):
 
 def _hash_to_uniform(seed):
     """SplitMix64 of int64 tensor → float64 tensor in [0,1)。torch 版。"""
+    import torch  # 局部导入：_hash_to_uniform 独立可用（_urshift 为鸭子类型）
+
     z = seed.to(torch.int64)
     z = z + _i64(_GOLDEN)
     z = (z ^ _urshift(z, 30)) * _i64(_SM_A)
@@ -136,7 +138,16 @@ def random_sampling_ref(
     u = _hash_to_uniform(combined).unsqueeze(-1)
     cdf = probs.to(torch.float64).cumsum(dim=-1)
     target = u * cdf[:, -1:]
-    return (cdf > target).long().argmax(dim=-1).int()
+    mask = cdf > target
+    out = mask.long().argmax(dim=-1)
+    # 理论边界（概率行总和为次正规数时 mask 可能全 False，argmax 返回 0 会命中
+    # 零概率列）：回退到最后一个非零列，与纯 Python 版契约一致
+    bad = ~mask.any(dim=-1)
+    if bool(bad.any()):
+        nz = probs > 0
+        last_nonzero = (nz.long().cumsum(dim=-1) * nz).argmax(dim=-1)
+        out = torch.where(bad, last_nonzero, out)
+    return out.int()
 
 
 # torch 仅在 random_sampling_ref 内部局部导入：CPU 调度栈不依赖 torch。

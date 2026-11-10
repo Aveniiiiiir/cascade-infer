@@ -98,12 +98,14 @@ def run_engine(
     steps = 0
     while sched.has_unfinished_requests:
         out = sched.schedule()
-        assert not out.is_empty, (
+        sampled = mock.step(out)
+        outputs = sched.update_from_output(sampled)
+        # 进度保证：要么调度了 token，要么本步产出了判死/中止输出
+        # （FINISHED_IGNORED 的空调度步是合法的——它清空了未完成集合）
+        assert not out.is_empty or outputs, (
             f"step {out.step_id}: scheduler made no progress but requests remain "
             f"(waiting={len(sched.waiting)}, running={len(sched.running)})"
         )
-        sampled = mock.step(out)
-        outputs = sched.update_from_output(sampled)
         for ro in outputs:
             result.outputs.setdefault(ro.request_id, []).extend(ro.new_token_ids)
             if ro.finish_reason is not None:

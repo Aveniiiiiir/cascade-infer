@@ -201,6 +201,12 @@ class EngineConfig:
         self.model.validate()
         self.cache.validate()
         self.scheduler.validate()
+        # 交叉校验（审查 #8）：单个 prompt 必须能过 sum-K 预算，否则超长 prompt
+        # 会被 sum-K 永久推迟（DeepInfer scheduler.hpp:120-121 的 TORCH_CHECK）
+        assert self.scheduler.prefill_sum_seqlen_k >= self.model.max_model_len, (
+            f"prefill_sum_seqlen_k ({self.scheduler.prefill_sum_seqlen_k}) 必须 >= "
+            f"max_model_len ({self.model.max_model_len})"
+        )
         # 位置余量：投机解码需要 max_model_len 之外再容纳 K+1 个回退位置
         # (DeepInfer: runtime_max_model_len = max_model_len + 2*nextn + 1)。
         nextn = self.model.num_nextn_predict_layers

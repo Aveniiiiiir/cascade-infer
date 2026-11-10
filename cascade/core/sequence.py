@@ -22,6 +22,7 @@ class SequenceStatus(Enum):
     FINISHED_ABORTED = "finished_aborted"
     FINISHED_PREEMPTED = "finished_preempted"  # stop 模式抢占（直接结束）
     FINISHED_SO_FAILED = "finished_so_failed"  # 结构化输出失败隔离（Phase 5）
+    FINISHED_IGNORED = "finished_ignored"  # KV 足迹永远超池容量（DeepInfer NEVER 路径）
 
     @property
     def is_finished(self) -> bool:
@@ -34,6 +35,7 @@ _FINISH_REASON = {
     SequenceStatus.FINISHED_ABORTED: "abort",
     SequenceStatus.FINISHED_PREEMPTED: "preempt",
     SequenceStatus.FINISHED_SO_FAILED: "so_failed",
+    SequenceStatus.FINISHED_IGNORED: "ignored",
 }
 
 
