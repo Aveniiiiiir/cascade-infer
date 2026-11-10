@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=77.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cascade-infer"
+version = "0.1.0"
+description = "Cascade: production-grade LLM inference engine (PyTorch + Triton, DeepSeek-first)"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "Cascade contributors" }]
+keywords = ["llm", "inference", "deepseek", "mla", "moe", "speculative-decoding"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.7",
+    "transformers>=4.46",
+    "safetensors>=0.4",
+]
+
+[project.optional-dependencies]
+# Triton 官方只发布 Linux 轮子；Windows 开发机上不需要装
+triton = [
+    "triton>=3.2,<4; sys_platform == 'linux'",
+]
+so = ["xgrammar>=0.2,<0.3"]
+serve = ["fastapi>=0.115", "uvicorn>=0.30", "sse-starlette>=2.0"]
+dev = ["pytest>=8.0", "pytest-timeout>=2.3", "ruff>=0.8"]
+
+[project.urls]
+Repository = "https://example.invalid/cascade-infer"
+
+[tool.setuptools.packages.find]
+include = ["cascade", "cascade.*"]
+
+[tool.pytest.ini_options]
+addopts = ["--import-mode=importlib", "-q"]
+testpaths = ["tests"]
+markers = [
+    "cpu: CPU-only tests, must pass on Windows (default gate)",
+    "gpu: tests requiring a Linux GPU host",
+    "benchmark: performance tests, not part of the correctness gate",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "UP", "B", "SIM", "I", "ANN"]
+ignore = ["ANN202", "ANN401", "E501", "E402", "B023"]

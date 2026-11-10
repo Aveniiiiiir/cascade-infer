@@ -1,0 +1,202 @@
+step=1 tok=300 dec=0 g0:P300*
+step=2 tok=47 dec=1 g0:D1 g1:P46*
+step=3 tok=92 dec=2 g1:D1 g0:D1 g2:P90*
+step=4 tok=153 dec=3 g2:D1 g1:D1 g0:D1 g3:P150*
+step=5 tok=504 dec=4 g3:D1 g2:D1 g1:D1 g0:D1 g4:P500*
+step=6 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=7 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=8 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=9 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=10 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=11 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=12 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=13 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=14 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=15 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=16 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=17 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=18 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=19 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=20 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=21 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=22 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=23 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=24 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=25 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=26 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=27 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=28 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=29 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=30 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=31 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=32 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=33 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=34 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=35 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=36 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=37 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=38 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=39 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=40 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=41 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=42 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=43 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=44 tok=5 dec=5 g4:D1 g3:D1 g2:D1 g1:D1 g0:D1
+step=45 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=46 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=47 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=48 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=49 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=50 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=51 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=52 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=53 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=54 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=55 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=56 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=57 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=58 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=59 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=60 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=61 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=62 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=63 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=64 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=65 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=66 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=67 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=68 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=69 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=70 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=71 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=72 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=73 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=74 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=75 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=76 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=77 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=78 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=79 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=80 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=81 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=82 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=83 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=84 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=85 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=86 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=87 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=88 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=89 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=90 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=91 tok=4 dec=4 g3:D1 g2:D1 g1:D1 g0:D1
+step=92 tok=3 dec=3 g3:D1 g2:D1 g0:D1
+step=93 tok=3 dec=3 g3:D1 g2:D1 g0:D1
+step=94 tok=3 dec=3 g3:D1 g2:D1 g0:D1
+step=95 tok=3 dec=3 g3:D1 g2:D1 g0:D1
+step=96 tok=3 dec=3 g3:D1 g2:D1 g0:D1
+step=97 tok=3 dec=3 g3:D1 g2:D1 g0:D1
+step=98 tok=3 dec=3 g3:D1 g2:D1 g0:D1
+step=99 tok=3 dec=3 g3:D1 g2:D1 g0:D1
+step=100 tok=3 dec=3 g3:D1 g2:D1 g0:D1
+step=101 tok=3 dec=3 g3:D1 g2:D1 g0:D1
+step=102 tok=3 dec=3 g3:D1 g2:D1 g0:D1
+step=103 tok=3 dec=3 g3:D1 g2:D1 g0:D1
+step=104 tok=3 dec=3 g3:D1 g2:D1 g0:D1
+step=105 tok=3 dec=3 g3:D1 g2:D1 g0:D1
+step=106 tok=3 dec=3 g3:D1 g2:D1 g0:D1
+step=107 tok=3 dec=3 g3:D1 g2:D1 g0:D1
+step=108 tok=3 dec=3 g3:D1 g2:D1 g0:D1
+step=109 tok=3 dec=3 g3:D1 g2:D1 g0:D1
+step=110 tok=3 dec=3 g3:D1 g2:D1 g0:D1
+step=111 tok=3 dec=3 g3:D1 g2:D1 g0:D1
+step=112 tok=3 dec=3 g3:D1 g2:D1 g0:D1
+step=113 tok=3 dec=3 g3:D1 g2:D1 g0:D1
+step=114 tok=3 dec=3 g3:D1 g2:D1 g0:D1
+step=115 tok=3 dec=3 g3:D1 g2:D1 g0:D1
+step=116 tok=3 dec=3 g3:D1 g2:D1 g0:D1
+step=117 tok=3 dec=3 g3:D1 g2:D1 g0:D1
+step=118 tok=3 dec=3 g3:D1 g2:D1 g0:D1
+step=119 tok=3 dec=3 g3:D1 g2:D1 g0:D1
+step=120 tok=3 dec=3 g3:D1 g2:D1 g0:D1
+step=121 tok=2 dec=2 g3:D1 g2:D1
+step=122 tok=2 dec=2 g3:D1 g2:D1
+step=123 tok=2 dec=2 g3:D1 g2:D1
+step=124 tok=2 dec=2 g3:D1 g2:D1
+step=125 tok=2 dec=2 g3:D1 g2:D1
+step=126 tok=2 dec=2 g3:D1 g2:D1
+step=127 tok=2 dec=2 g3:D1 g2:D1
+step=128 tok=2 dec=2 g3:D1 g2:D1
+step=129 tok=2 dec=2 g3:D1 g2:D1
+step=130 tok=2 dec=2 g3:D1 g2:D1
+step=131 tok=2 dec=2 g3:D1 g2:D1
+step=132 tok=2 dec=2 g3:D1 g2:D1
+step=133 tok=2 dec=2 g3:D1 g2:D1
+step=134 tok=2 dec=2 g3:D1 g2:D1
+step=135 tok=2 dec=2 g3:D1 g2:D1
+step=136 tok=2 dec=2 g3:D1 g2:D1
+step=137 tok=2 dec=2 g3:D1 g2:D1
+step=138 tok=2 dec=2 g3:D1 g2:D1
+step=139 tok=2 dec=2 g3:D1 g2:D1
+step=140 tok=2 dec=2 g3:D1 g2:D1
+step=141 tok=2 dec=2 g3:D1 g2:D1
+step=142 tok=2 dec=2 g3:D1 g2:D1
+step=143 tok=2 dec=2 g3:D1 g2:D1
+step=144 tok=2 dec=2 g3:D1 g2:D1
+step=145 tok=2 dec=2 g3:D1 g2:D1
+step=146 tok=2 dec=2 g3:D1 g2:D1
+step=147 tok=2 dec=2 g3:D1 g2:D1
+step=148 tok=2 dec=2 g3:D1 g2:D1
+step=149 tok=2 dec=2 g3:D1 g2:D1
+step=150 tok=2 dec=2 g3:D1 g2:D1
+step=151 tok=2 dec=2 g3:D1 g2:D1
+step=152 tok=2 dec=2 g3:D1 g2:D1
+step=153 tok=2 dec=2 g3:D1 g2:D1
+step=154 tok=2 dec=2 g3:D1 g2:D1
+step=155 tok=2 dec=2 g3:D1 g2:D1
+step=156 tok=2 dec=2 g3:D1 g2:D1
+step=157 tok=2 dec=2 g3:D1 g2:D1
+step=158 tok=2 dec=2 g3:D1 g2:D1
+step=159 tok=2 dec=2 g3:D1 g2:D1
+step=160 tok=2 dec=2 g3:D1 g2:D1
+step=161 tok=2 dec=2 g3:D1 g2:D1
+step=162 tok=2 dec=2 g3:D1 g2:D1
+step=163 tok=2 dec=2 g3:D1 g2:D1
+step=164 tok=1 dec=1 g2:D1
+step=165 tok=1 dec=1 g2:D1
+step=166 tok=1 dec=1 g2:D1
+step=167 tok=1 dec=1 g2:D1
+step=168 tok=1 dec=1 g2:D1
+step=169 tok=1 dec=1 g2:D1
+step=170 tok=1 dec=1 g2:D1
+step=171 tok=1 dec=1 g2:D1
+step=172 tok=1 dec=1 g2:D1
+step=173 tok=1 dec=1 g2:D1
+step=174 tok=1 dec=1 g2:D1
+step=175 tok=1 dec=1 g2:D1
+step=176 tok=1 dec=1 g2:D1
+step=177 tok=1 dec=1 g2:D1
+step=178 tok=1 dec=1 g2:D1
+step=179 tok=1 dec=1 g2:D1
+step=180 tok=1 dec=1 g2:D1
+step=181 tok=1 dec=1 g2:D1
+step=182 tok=1 dec=1 g2:D1
+step=183 tok=1 dec=1 g2:D1
+step=184 tok=1 dec=1 g2:D1
+step=185 tok=1 dec=1 g2:D1
+step=186 tok=1 dec=1 g2:D1
+step=187 tok=1 dec=1 g2:D1
+step=188 tok=1 dec=1 g2:D1
+step=189 tok=1 dec=1 g2:D1
+step=190 tok=1 dec=1 g2:D1
+step=191 tok=1 dec=1 g2:D1
+step=192 tok=1 dec=1 g2:D1
+step=193 tok=1 dec=1 g2:D1
+step=194 tok=1 dec=1 g2:D1
+step=195 tok=1 dec=1 g2:D1
+step=196 tok=1 dec=1 g2:D1
+step=197 tok=1 dec=1 g2:D1
+step=198 tok=1 dec=1 g2:D1
+step=199 tok=1 dec=1 g2:D1
+step=200 tok=1 dec=1 g2:D1
+step=201 tok=1 dec=1 g2:D1
+step=202 tok=1 dec=1 g2:D1
