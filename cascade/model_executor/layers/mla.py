@@ -114,39 +114,106 @@ class MLAAttention(nn.Module):
         # 2. 写 paged KV：[c ‖ k_rope(已 rope)]（triton/ref 自动分发）
         latent = torch.cat((c, k_rope), dim=-1)  # [T, 576]
         cache.store_latent(self.layer_idx, latent, seq_ids, positions, block_tables)
-        # 3. 分段注意力
+        # 3. 注意力
+        if use_absorbed:
+            out = self._forward_absorbed_batched(
+                q_nope, q_rope, positions, segment_lens, block_tables, cache
+            )
+        else:
+            out = self._forward_explicit_loop(
+                q_nope, q_rope, positions, seq_ids, segment_lens, block_tables, cache
+            )
+        return self.o_proj(out)  # [T, h*128] → [T, H]
+
+    def _forward_explicit_loop(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        positions: torch.Tensor,
+        seq_ids: torch.Tensor,
+        segment_lens: list[int],
+        block_tables: torch.Tensor,
+        cache: CacheEngine,
+    ) -> torch.Tensor:
+        """显式路径（HF 对拍 oracle）：逐段材料化 k_nope/v。"""
         outs = []
         offset = 0
         for seg_i, seg_len in enumerate(segment_lens):
             sl = slice(offset, offset + seg_len)
-            out = self._attend_segment(
+            out = self._attend_segment_explicit(
                 q_nope[sl], q_rope[sl], positions[sl],
-                seq_row=int(seq_ids[sl.start].item()),
-                num_kv=int(positions[sl.start].item()) + seg_len,  # 段首位置 + 段长 = 历史总数
-                block_tables=block_tables,
-                cache=cache,
-                use_absorbed=use_absorbed,
+                cache.gather_range_reference(
+                    self.layer_idx,
+                    int(seq_ids[sl.start].item()),
+                    int(positions[sl.start].item()) + seg_len,
+                    block_tables,
+                ),
             )
             outs.append(out)
             offset += seg_len
-        out = torch.cat(outs, dim=0)  # [T, h*128]
-        return self.o_proj(out)
+        return torch.cat(outs, dim=0)
 
-    def _attend_segment(
+    def _forward_absorbed_batched(
         self,
-        q_nope: torch.Tensor,  # [L, h, 128]
-        q_rope: torch.Tensor,  # [L, h, 64]（已 rope）
-        positions: torch.Tensor,  # [L]（绝对）
-        seq_row: int,
-        num_kv: int,
-        block_tables: torch.Tensor,
+        q_nope: torch.Tensor,  # [T, h, 128]
+        q_rope: torch.Tensor,  # [T, h, 64]（已 rope）
+        positions: torch.Tensor,  # [T]
+        segment_lens: list[int],
+        block_tables: torch.Tensor,  # [n_seqs, max_blocks]
         cache: CacheEngine,
-        use_absorbed: bool,
     ) -> torch.Tensor:
-        kv = cache.gather_range_reference(self.layer_idx, seq_row, num_kv, block_tables)  # [P, 576]
-        if use_absorbed:
-            return self._attend_segment_absorbed(q_nope, q_rope, positions, kv)
-        return self._attend_segment_explicit(q_nope, q_rope, positions, kv)
+        """吸收路径批处理：多 token 段走 prefill kernel，单 token 段（decode）
+        走 split-K decode kernel；kernel 按精度自动分发（fp32 → ref）。
+
+        段与 block_tables 行 1:1（一个 seq 每步至多一个段）。
+        """
+        from cascade.model_executor.triton_ops.paged_mla_decode_attn import (
+            paged_mla_decode_attn,
+        )
+        from cascade.model_executor.triton_ops.paged_mla_prefill_attn import (
+            paged_mla_prefill_attn,
+        )
+
+        T = q_nope.shape[0]
+        kv = cache.layer_view(self.layer_idx)
+        # q 吸收 W_UK：q_abs 与 latent c 点积（fp32 计算）
+        q_abs = torch.einsum("thd,hdk->thk", q_nope.float(), self.u_k.float())
+        q_full = torch.cat((q_abs, q_rope.float()), dim=-1).to(kv.dtype)  # [T, h, 576]
+        # 段偏移与每段 KV 上界（= 段首位置 + 段长；decode 段为 pos+1）
+        offsets = []
+        acc = 0
+        for n in segment_lens:
+            offsets.append(acc)
+            acc += n
+        assert acc == T
+        seqlens = torch.tensor(
+            [int(positions[o].item()) + n for o, n in zip(offsets, segment_lens)],
+            dtype=torch.int64,
+            device=kv.device,
+        )
+        out_latent = torch.empty(T, self.num_heads, self.kv_lora, dtype=torch.float32, device=kv.device)
+        # ---- 多 token 段：prefill kernel（varlen 因果）----
+        multi_segs = [(i, int(positions[o].item()), n) for i, (o, n) in enumerate(zip(offsets, segment_lens)) if n > 1]
+        if multi_segs:
+            rows = torch.cat(
+                [torch.arange(offsets[i], offsets[i] + n, device=kv.device) for i, _, n in multi_segs]
+            )
+            q_m = q_full.index_select(0, rows).contiguous()
+            out_latent[rows] = paged_mla_prefill_attn(
+                q_m, kv, block_tables, seqlens, multi_segs, self.scale, self.kv_lora
+            )
+        # ---- 单 token 段（decode）：split-K kernel ----
+        decode_segs = [i for i, n in enumerate(segment_lens) if n == 1]
+        if decode_segs:
+            rows = torch.tensor([offsets[i] for i in decode_segs], device=kv.device)
+            q_d = q_full.index_select(0, rows).contiguous()
+            bt_d = block_tables.index_select(0, torch.tensor(decode_segs, device=kv.device))
+            sl_d = seqlens.index_select(0, torch.tensor(decode_segs, device=kv.device))
+            out_d = paged_mla_decode_attn(q_d, kv, bt_d, sl_d, self.scale, self.kv_lora)
+            out_latent[rows] = out_d.to(torch.float32)
+        # W_UV 上投影
+        out = torch.einsum("thk,hdk->thd", out_latent, self.u_v.float())  # [T, h, 128] fp32
+        return out.to(kv.dtype).reshape(T, self.num_heads * self.v_head)
 
     # ------------------------------------------------------------------ explicit (HF oracle)
 
