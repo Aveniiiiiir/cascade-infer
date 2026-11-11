@@ -50,6 +50,17 @@ class Sampler:
         so_bitmask: torch.Tensor | None = None,  # [n_rows, ceil(vocab/32)] int32
         so_row_map: torch.Tensor | None = None,  # [R] int32
     ) -> list[int]:
+        """同步采样 → CPU token 列表（测试/同步路径）。"""
+        return self.sample_tensors(logits, rows, so_bitmask, so_row_map).tolist()
+
+    def sample_tensors(
+        self,
+        logits: torch.Tensor,
+        rows: SamplingRows,
+        so_bitmask: torch.Tensor | None = None,
+        so_row_map: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """GPU 采样 → [R] int32（ZOS：launch 后异步 D2H，不碰 CPU）。"""
         assert logits.ndim == 2 and logits.is_contiguous() and logits.dtype == torch.float32
         R, vocab = logits.shape
         assert rows.seq_seeds.shape == (R,), f"{rows.seq_seeds.shape} vs ({R},)"
@@ -60,10 +71,10 @@ class Sampler:
         probs = self._transform(logits, rows)
         # 3. 确定性采样
         out = det_random_sampling(probs, rows.seq_seeds, rows.positions, case=0, seed_offset=0)
-        out = out.tolist()
-        # 4. golden teacher-forcing
-        goldens = rows.goldens.tolist()
-        return [g if g >= 0 else o for g, o in zip(goldens, out)]
+        # 4. golden teacher-forcing（GPU 侧 where，免 CPU 往返）
+        if rows.goldens.numel() and bool((rows.goldens >= 0).any()):
+            out = torch.where(rows.goldens >= 0, rows.goldens, out)
+        return out
 
     # ------------------------------------------------------------------ transforms
 

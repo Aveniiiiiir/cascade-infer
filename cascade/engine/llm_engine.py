@@ -19,7 +19,7 @@ _log = get_logger("engine.llm_engine")
 
 
 class LLMEngine:
-    __slots__ = ("cfg", "scheduler", "runner", "block_mgr", "_request_counter")
+    __slots__ = ("cfg", "scheduler", "runner", "block_mgr", "_request_counter", "_prev_sample")
 
     def __init__(
         self,
@@ -44,8 +44,9 @@ class LLMEngine:
         )
         self.scheduler = Scheduler(engine_cfg, self.block_mgr, prefix_cache)
         self._request_counter = 0
+        self._prev_sample = None  # 上一步的 SampleLaunch（ZOS 在途状态）
         _log.info(
-            "LLMEngine ready: model=%s blocks=%d prefix_cache=%s",
+            "LLMEngine ready (ZOS 三段式): model=%s blocks=%d prefix_cache=%s",
             model_dir,
             num_blocks,
             prefix_cache is not None,
@@ -74,13 +75,31 @@ class LLMEngine:
         return self.scheduler.has_unfinished_requests
 
     def step(self) -> list[RequestOutput]:
-        """一步：调度 → 准备 → 前向 → 确定性采样 → 提交。"""
+        """ZOS 三段式（对应 DeepInfer worker.py:89 的 Forward→PostProcess(prev)→Sample）：
+
+        1. schedule(N) + prepare + **launch** forward(N)（CPU 立即返回）
+        2. post_process(N−1)：唯一同步点 = 上一步采样事件 → 提交调度器
+        3. launch sample(N) + 异步 D2H（留给下一步的 post_process）
+
+        GPU 跑 forward(N)→sample(N) 的同时，CPU 并发跑 schedule(N+1) 前的
+        提交与产出逻辑 —— 调度与执行重叠，无空泡。
+        """
         sched_out = self.scheduler.schedule()
         if sched_out.is_empty:
-            return []
+            # 无新工作：冲刷上一步在途采样后返回
+            return self._post_process_prev()
         batch = self.runner.prepare_batch(sched_out)
-        logits = self.runner.forward(batch)
-        sampled = self.runner.sample_rows(logits, sched_out, batch)
+        logits = self.runner.forward(batch)  # 只 launch
+        outputs = self._post_process_prev()  # 与 forward(N) GPU 执行重叠
+        self._prev_sample = self.runner.launch_sample(logits, sched_out, batch)
+        return outputs
+
+    def _post_process_prev(self) -> list[RequestOutput]:
+        if self._prev_sample is None:
+            return []
+        launch = self._prev_sample
+        self._prev_sample = None
+        sampled = launch.wait_tokens()  # 唯一 CPU-GPU 同步点
         return self.scheduler.update_from_output(sampled)
 
     def generate(
@@ -108,6 +127,12 @@ class LLMEngine:
                 results[ro.request_id].extend(ro.new_token_ids)
                 if ro.finish_reason is not None:
                     finish[ro.request_id] = ro.finish_reason
+        # 冲刷最后一个在途步骤（ZOS 尾部：1 步 lag 的提交 + 残留 pending）
+        for ro in self._post_process_prev():
+            results[ro.request_id].extend(ro.new_token_ids)
+            if ro.finish_reason is not None:
+                finish[ro.request_id] = ro.finish_reason
+        assert not self.scheduler.has_unfinished_requests
         return results
 
 

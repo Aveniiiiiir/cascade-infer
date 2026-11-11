@@ -38,6 +38,23 @@ class ForwardBatch:
     segment_offsets: list[int]
 
 
+@dataclass(slots=True)
+class SampleLaunch:
+    """一步采样的在途状态（ZOS：launch → 异步 D2H → 下一步 post_process 提交）。"""
+
+    request_ids: list[str]
+    pinned: torch.Tensor  # [R] int32 CPU（pinned；CUDA 事件守卫）
+    event: object | None  # torch.cuda.Event（无 CUDA 时 None）
+    sched_out: "SchedulerOutput"  # 提交时需要（持有以简化引擎侧簿记）
+
+    def wait_tokens(self) -> dict[str, list[int]]:
+        """唯一 CPU-GPU 同步点：等待采样 + D2H 完成 → request_id → token。"""
+        if self.event is not None:
+            self.event.synchronize()
+        tokens = self.pinned.tolist()
+        return {rid: [int(t)] for rid, t in zip(self.request_ids, tokens)}
+
+
 class ModelRunner:
     __slots__ = ("engine_cfg", "model", "cfg", "cache", "device", "dtype", "use_absorbed", "sampler")
 
@@ -133,16 +150,15 @@ class ModelRunner:
             use_absorbed=self.use_absorbed,
         )
 
-    def sample_rows(
+    def launch_sample(
         self,
         logits: torch.Tensor,
         sched_out: SchedulerOutput,
         batch: ForwardBatch,
-    ) -> dict[str, list[int]]:
-        """确定性采样（温度/top-p/top-k 变换 + det RNG；贪心经退化路径）。
+    ) -> SampleLaunch | None:
+        """三段式第 3 段：启动确定性采样 + 异步 D2H（不碰 CPU 结果）。
 
-        每段的最后一行（decode 行或 prefill 收尾行）参与采样；
-        新 token 的绝对位置 = seq.num_tokens（update 追加前），
+        token 的绝对位置 = seq.num_tokens（update 追加前），
         golden 索引 = seq.num_output_tokens（追加前）。
         """
         sel: list[tuple[str, object, int, int]] = []
@@ -163,11 +179,28 @@ class ModelRunner:
                 )
             )
         if not sel:
-            return {}
+            return None
         rows = build_sampling_rows(sel, self.device)
         logits_rows = logits[rows_idx].to(torch.float32).contiguous()
-        tokens = self.sampler.sample(logits_rows, rows)
-        return {rid: [int(t)] for (rid, _, _, _), t in zip(sel, tokens)}
+        tokens = self.sampler.sample_tensors(logits_rows, rows)
+        is_cuda = str(self.device).startswith("cuda")
+        pinned = torch.empty(
+            tokens.shape,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=is_cuda,
+        )
+        pinned.copy_(tokens, non_blocking=is_cuda)
+        event = None
+        if is_cuda:
+            event = torch.cuda.Event()
+            event.record()
+        return SampleLaunch(
+            request_ids=[rid for rid, _, _, _ in sel],
+            pinned=pinned,
+            event=event,
+            sched_out=sched_out,
+        )
 
 
-__all__ = ["ModelRunner", "ForwardBatch"]
+__all__ = ["ModelRunner", "ForwardBatch", "SampleLaunch"]

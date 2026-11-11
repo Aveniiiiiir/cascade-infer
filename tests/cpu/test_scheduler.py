@@ -353,16 +353,18 @@ def test_multiple_whole_prompts_packed_per_step() -> None:
 
 
 def test_schedule_reentry_guard() -> None:
-    """审查 #7：连续 schedule 不夹 update → 显式 AssertionError。"""
+    """审查 #7（ZOS 语义更新）：两次连续 schedule = 合法 1 步 lag（深度 2）；
+    第三次（入口深度 2）→ 显式 AssertionError。"""
     from cascade.core.block_manager import BlockManager
     from cascade.core.scheduler import Scheduler
     from cascade.sampling_params import SamplingParams
 
     sched = Scheduler(make_config(), BlockManager(16), None)
     sched.add_request("r", list(range(10)), SamplingParams())
-    sched.schedule()
+    sched.schedule()  # 深度 1
+    sched.schedule()  # 深度 2（ZOS 合法：schedule(N) 时 pending={N-1}）
     with pytest.raises(AssertionError, match="重入"):
-        sched.schedule()
+        sched.schedule()  # 深度 3 → 拒绝
 
 
 def test_abort_in_limbo_window() -> None:

@@ -85,8 +85,8 @@ class Scheduler:
         "waiting",
         "running",
         "_step",
-        "_last_output",
         "_pending_outputs",
+        "_pending_req_outputs",
         "_preempted_this_step",
         "_trace",
     )
@@ -105,8 +105,11 @@ class Scheduler:
         self.waiting: deque[Sequence] = deque()
         self.running: list[Sequence] = []
         self._step = 0
-        self._last_output: SchedulerOutput | None = None
-        self._pending_outputs: list[RequestOutput] = []
+        #: 已调度未提交的 SchedulerOutput 队列（ZOS 深度 ≤ 2：
+        #: schedule(N) 时 pending={N-1}，post_process(N-1) 在 forward(N) 后弹出）
+        self._pending_outputs: deque[SchedulerOutput] = deque()
+        #: 判死请求的最终输出（STOP 抢占/abort/ignored），update 时冲刷
+        self._pending_req_outputs: list[RequestOutput] = []
         #: 本步被抢占的 seq（含 STOP/RECOMPUTE），调度循环内跳过
         self._preempted_this_step: set[str] = set()
         self._trace: list[str] = []
@@ -139,11 +142,12 @@ class Scheduler:
 
     @property
     def has_unfinished_requests(self) -> bool:
-        """含 schedule→update 窗口内"队列外悬空"的 seq（完成 prefill 待提交者）。"""
+        """含已调度未提交（在途/悬空）的 seq。"""
         if self.waiting or self.running:
             return True
-        if self._last_output is not None:
-            return any(not s.seq.is_finished for s in self._last_output.scheduled)
+        for out in self._pending_outputs:
+            if any(not s.seq.is_finished for s in out.scheduled):
+                return True
         return False
 
     def abort(self, request_id: str) -> bool:
@@ -161,9 +165,9 @@ class Scheduler:
         乐观推进：本函数内即推进 num_tokens_computed 并分配 KV 块；
         update_from_output 在执行结果返回后做提交（追加 token/判停）。
         """
-        assert self._last_output is None, (
-            "schedule() 被重入：上一步的 update_from_output 尚未调用 "
-            "（乐观推进会被覆盖导致状态腐蚀；ZOS Phase 4 将改为待提交队列）"
+        assert len(self._pending_outputs) <= 1, (
+            "schedule() 重入/乱序：已有 2 个未提交的调度输出（ZOS 协议为 1 步 lag，"
+            "pending 深度 ≤ 2；sync 循环为 schedule→update 交替，深度 ≤ 1）"
         )
         out = SchedulerOutput(step_id=self._step + 1)
         self._preempted_this_step = set()
@@ -247,36 +251,40 @@ class Scheduler:
             budget -= chunk
             sum_seqlen_k += seq.num_tokens
             if completes:
-                # 末 chunk：seq 暂存于 scheduled，update 时 waiting→running；
-                # 继续尝试打包下一个完整 prompt（budget 允许时）
-                pass
+                # 末 chunk：**乐观晋升** running（ZOS：schedule(N+1) 早于 update(N)，
+                # 提前入队消除一步气泡；执行无法失败 ⇒ 晋升安全；首个 token 即
+                # EOS 的场景由 update 的 skip-finished 兜底）
+                seq.status = SequenceStatus.RUNNING
+                self.running.append(seq)
             else:
                 self.waiting.appendleft(seq)  # chunked：留队头，本步不再收第二个 chunked
                 chunked_seen = True
 
         assert out.total_new_tokens == sum(s.num_new_tokens for s in out.scheduled)
         self._step = out.step_id
-        self._last_output = out
+        self._pending_outputs.append(out)
         self._trace.append(self._trace_line(out))
         return out
 
     # ------------------------------------------------------------------ commit
 
     def update_from_output(self, sampled: dict[str, list[int]]) -> list[RequestOutput]:
-        """提交一步的采样结果（ZOS Phase 4 起，本函数将滞后一步调用）。
+        """提交**最旧**未提交调度输出的采样结果（ZOS：滞后一步调用）。
 
         窗口内被 abort/判死的 seq 直接跳过（DeepInfer process_outputs :906
         对 finished 跳过，不靠 assert）——其块已在 _finish_sequence 释放。
+        在途被 RECOMPUTE 抢占的 seq 正常提交（token 是真实生成物，重算时
+        连同输出一起重建 KV）。
 
         Args:
             sampled: request_id → 新采样 token 列表。prefill 中间 chunk 无条目；
                 末 chunk 与 decode 各产出 1 个 token（Phase 5 MTP 起可为多个）。
         """
-        outputs = list(self._pending_outputs)
-        self._pending_outputs.clear()
-        last = self._last_output
-        if last is None:
+        outputs = list(self._pending_req_outputs)
+        self._pending_req_outputs.clear()
+        if not self._pending_outputs:
             return outputs
+        last = self._pending_outputs.popleft()
         for scheduled in last.scheduled:
             seq = scheduled.seq
             if seq.is_finished:
@@ -295,11 +303,7 @@ class Scheduler:
             finish_status = self._check_stop(seq, token)
             if finish_status is not None:
                 seq.finish(finish_status)
-            # prefill 收尾：waiting → running（完成的留在 scheduled 里直到下一步）
-            if scheduled.completes_prefill and not seq.is_finished:
-                assert seq.status is SequenceStatus.WAITING
-                seq.status = SequenceStatus.RUNNING
-                self.running.append(seq)
+            # prefill 收尾的 running 晋升已在 schedule 时乐观完成
             # 新满块入前缀缓存
             self._register_full_blocks(seq)
             # ---- 产出（finish_reason 已就位）----
@@ -314,7 +318,6 @@ class Scheduler:
             )
             if seq.is_finished:
                 self._release_and_remove(seq)
-        self._last_output = None
         return outputs
 
     # ------------------------------------------------------------------ internals: block accounting
@@ -467,8 +470,8 @@ class Scheduler:
     def _finish_sequence(self, seq: Sequence, status: SequenceStatus) -> None:
         seq.finish(status)
         self._release_and_remove(seq)
-        # FINISHED_* 的最终输出（STOP 抢占 / abort / ignored）
-        self._pending_outputs.append(
+        # FINISHED_* 的最终输出（STOP 抢占 / abort / ignored），update 时冲刷
+        self._pending_req_outputs.append(
             RequestOutput(
                 request_id=seq.request_id,
                 new_token_ids=[],
@@ -507,9 +510,9 @@ class Scheduler:
         for seq in list(self.waiting) + self.running:
             if seq.request_id == request_id:
                 return seq
-        # schedule→update 窗口内的"队列外悬空"seq（完成 prefill 待提交者）
-        if self._last_output is not None:
-            for s in self._last_output.scheduled:
+        # 已调度未提交（在途/悬空）的 seq
+        for out in self._pending_outputs:
+            for s in out.scheduled:
                 if s.seq.request_id == request_id:
                     return s.seq
         return None
