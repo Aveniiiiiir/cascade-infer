@@ -182,24 +182,24 @@ class Scheduler:
                 break
             if seq.is_finished or seq.request_id in self._preempted_this_step:
                 continue  # 排序副本中的已抢占/已结束 seq
-            ok = self._acquire_kv(seq, num_new_tokens=1, out=out)
+            # MTP：decode 行 = 1 fresh + K 验证行（乐观推进；提交时回滚未接受部分）
+            num_new = 1 + self.cfg.scheduler.nextn_draft_tokens
+            ok = self._acquire_kv(seq, num_new_tokens=num_new, out=out)
             if not ok:
                 # 永不满足：自身足迹已超池（自抢占排除自身 → 无候选可抢）。
                 # DeepInfer NEVER 路径：判 FINISHED_IGNORED 而非活锁空转。
-                if seq.num_blocks_for(seq.num_tokens, self.block_size) > self.block_mgr.num_blocks:
+                if seq.num_blocks_for(seq.num_tokens + num_new - 1, self.block_size) > self.block_mgr.num_blocks:
                     _log.warning(
-                        "request %s: KV footprint %d blocks exceeds pool %d → FINISHED_IGNORED",
+                        "request %s: KV footprint exceeds pool → FINISHED_IGNORED",
                         seq.request_id,
-                        seq.num_blocks_for(seq.num_tokens, self.block_size),
-                        self.block_mgr.num_blocks,
                     )
                     self._finish_sequence(seq, SequenceStatus.FINISHED_IGNORED)
                 continue
-            out.scheduled.append(ScheduledSeq(seq, 1, is_prefill=False))
-            seq.num_tokens_computed += 1
-            out.total_new_tokens += 1
+            out.scheduled.append(ScheduledSeq(seq, num_new, is_prefill=False))
+            seq.num_tokens_computed += num_new
+            out.total_new_tokens += num_new
             out.num_decode_seqs += 1
-            budget -= 1
+            budget -= num_new
 
         # ---- prefill（FCFS；多个完整 prompt 可打包进同一步，sum-K/max_seqs 封顶；
         #       超预算者 chunk 化，一步至多一个 chunked seq —— DeepInfer :543 只在
@@ -293,24 +293,30 @@ class Scheduler:
             if scheduled.is_prefill and not scheduled.completes_prefill:
                 assert not new_tokens, f"{seq.request_id}: 中间 chunk 不应产出 token"
                 continue
-            assert len(new_tokens) == 1, (
-                f"{seq.request_id}: Phase 1 每步至多 1 个 token, got {new_tokens}"
+            assert 1 <= len(new_tokens) <= scheduled.num_new_tokens, (
+                f"{seq.request_id}: 采样 token 数 {len(new_tokens)} 超出调度行 "
+                f"{scheduled.num_new_tokens}（MTP 提交契约）"
             )
-            token = new_tokens[0]
-            seq.append_output_tokens([token])
+            # ---- 截断：max_tokens / max_model_len / 首个 stop token ----
+            final, finish_status = self._truncate_new_tokens(seq, new_tokens)
+            seq.append_output_tokens(final)
 
-            # ---- 判停（首个 stop token 截断；MTP 多 token 时同样适用）----
-            finish_status = self._check_stop(seq, token)
+            # ---- 乐观回滚（仅 decode/MTP 行）：prefill 行的 num_new 全部真实
+            # （chunk 的 KV 全部提交），不做回滚；decode 行的差额 = 被拒 draft，
+            # 释放多预留尾块（其 KV 垃圾随块回收）----
+            if not scheduled.is_prefill:
+                self._commit_optimistic_advance(seq, scheduled.num_new_tokens, len(final))
+
             if finish_status is not None:
                 seq.finish(finish_status)
             # prefill 收尾的 running 晋升已在 schedule 时乐观完成
-            # 新满块入前缀缓存
+            # 新满块入前缀缓存（回滚后 computed 正确 ⇒ 不会注册垃圾块）
             self._register_full_blocks(seq)
             # ---- 产出（finish_reason 已就位）----
             outputs.append(
                 RequestOutput(
                     request_id=seq.request_id,
-                    new_token_ids=[token],
+                    new_token_ids=list(final),
                     output_token_ids=list(seq.output_token_ids),
                     finish_reason=seq.finish_reason,
                     num_cached_tokens=seq.num_cached_tokens,
@@ -492,6 +498,50 @@ class Scheduler:
             self.waiting.remove(seq)
         except ValueError:
             pass
+
+    def _truncate_new_tokens(
+        self, seq: Sequence, new_tokens: list[int]
+    ) -> tuple[list[int], SequenceStatus | None]:
+        """多 token 提交的截断：输出上限 / 位置上限 / 首个 stop token。
+
+        Returns: (最终提交的 token 列表, finish_status 或 None)。
+        """
+        # 上限：max_tokens 剩余额度 + 位置余量
+        allowed = min(
+            len(new_tokens),
+            seq.sampling.max_tokens - seq.num_output_tokens,
+            self.cfg.model.max_model_len - seq.num_tokens,
+        )
+        assert allowed >= 1, (
+            f"{seq.request_id}: 上限校验失效（调度不应再给该 seq 排行）"
+        )
+        out: list[int] = []
+        finish: SequenceStatus | None = None
+        for i, tok in enumerate(new_tokens):
+            if i >= allowed:
+                finish = SequenceStatus.FINISHED_LENGTH_CAPPED
+                break
+            out.append(tok)
+            if seq.sampling.is_stop_token(tok):
+                finish = SequenceStatus.FINISHED_STOPPED
+                break
+        if finish is None and allowed < len(new_tokens):
+            finish = SequenceStatus.FINISHED_LENGTH_CAPPED
+        if finish is None and seq.num_output_tokens + len(out) >= seq.sampling.max_tokens:
+            finish = SequenceStatus.FINISHED_LENGTH_CAPPED
+        if finish is None and seq.num_tokens + len(out) >= self.cfg.model.max_model_len:
+            finish = SequenceStatus.FINISHED_LENGTH_CAPPED
+        return out, finish
+
+    def _commit_optimistic_advance(self, seq: Sequence, scheduled_new: int, committed: int) -> None:
+        """乐观推进的提交回滚（ZOS/MTP：schedule 已前移 scheduled_new，
+        实际接受 committed ⇒ 回退差额并释放多预留尾块）。"""
+        if committed >= scheduled_new:
+            return
+        seq.num_tokens_computed -= scheduled_new - committed
+        n_keep = seq.num_blocks_for(seq.num_tokens_computed, self.block_size)
+        while len(seq.block_table) > n_keep:
+            self.block_mgr.release(seq.block_table.pop())
 
     def _check_stop(self, seq: Sequence, token: int) -> SequenceStatus | None:
         if seq.sampling.is_stop_token(token):

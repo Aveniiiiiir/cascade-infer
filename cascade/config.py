@@ -183,11 +183,15 @@ class SchedulerConfig:
     prefill_sum_seqlen_k: int = 32768  # sum-of-context budget for one prefill batch
     enable_prefix_caching: bool = True
     preemption_recompute: bool = True
+    #: MTP 固定验证长度：decode 行的 num_new_tokens = 1 + K
+    #: （Phase 5 varlen 调度会按置信率逐请求调整；0 = 关闭 MTP）
+    nextn_draft_tokens: int = 0
 
     def validate(self) -> None:
         assert self.max_num_seqs > 0
         assert self.max_num_batched_tokens > 0
         assert self.prefill_sum_seqlen_k > 0
+        assert self.nextn_draft_tokens >= 0
 
 
 @dataclass
