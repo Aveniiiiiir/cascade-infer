@@ -184,14 +184,22 @@ class SchedulerConfig:
     enable_prefix_caching: bool = True
     preemption_recompute: bool = True
     #: MTP 固定验证长度：decode 行的 num_new_tokens = 1 + K
-    #: （Phase 5 varlen 调度会按置信率逐请求调整；0 = 关闭 MTP）
+    #: （varlen 调度会按置信率逐请求调整；0 = 关闭 MTP）
     nextn_draft_tokens: int = 0
+    #: 置信度调度变长验证（DeepInfer ENABLE_MTP_VARLEN 语义；与批不变
+    #: 互斥——验证长度随 batch 组合变化）
+    mtp_varlen: bool = False
 
     def validate(self) -> None:
         assert self.max_num_seqs > 0
         assert self.max_num_batched_tokens > 0
         assert self.prefill_sum_seqlen_k > 0
         assert self.nextn_draft_tokens >= 0
+        if self.mtp_varlen:
+            assert self.nextn_draft_tokens > 0, "varlen 需要 MTP 开启"
+            from cascade.common.env import envs
+
+            assert not envs.BATCH_INVARIANT, "varlen 与批不变互斥（DeepInfer 同此）"
 
 
 @dataclass

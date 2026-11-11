@@ -41,6 +41,7 @@ from cascade.common.logger import get_logger
 from cascade.config import EngineConfig
 from cascade.core.block_manager import BlockAllocationError, BlockManager
 from cascade.core.prefix_cache import PrefixCache
+from cascade.core.mtp_varlen import MtpVarlen
 from cascade.core.sequence import (
     RequestOutput,
     Sequence,
@@ -89,6 +90,8 @@ class Scheduler:
         "_pending_req_outputs",
         "_preempted_this_step",
         "_trace",
+        "_mtp_rates",
+        "_mtp_varlen",
     )
 
     def __init__(
@@ -113,6 +116,11 @@ class Scheduler:
         #: 本步被抢占的 seq（含 STOP/RECOMPUTE），调度循环内跳过
         self._preempted_this_step: set[str] = set()
         self._trace: list[str] = []
+        #: MTP varlen：per-seq 累乘率（引擎在验证后回灌 accept_probs）
+        self._mtp_rates: dict[str, list[float]] = {}
+        self._mtp_varlen = (
+            MtpVarlen(cfg.scheduler.nextn_draft_tokens) if cfg.scheduler.mtp_varlen else None
+        )
 
     # ------------------------------------------------------------------ intake
 
@@ -177,13 +185,27 @@ class Scheduler:
         sum_seqlen_k = 0
 
         # ---- decode（LCFS：最新请求优先 = output_len 升序）----
+        # varlen 模式：先定参与集合，按累乘率分配逐 seq 验证长度
+        varlen_plan: dict[str, int] | None = None
+        if self._mtp_varlen is not None:
+            candidates = [
+                seq
+                for seq in sorted(self.running, key=lambda s: s.num_output_tokens)
+                if not seq.is_finished and seq.request_id not in self._preempted_this_step
+            ][: max_seqs]
+            K = self.cfg.scheduler.nextn_draft_tokens
+            rates = {s.request_id: self._mtp_rates.get(s.request_id, [0.0] * K) for s in candidates}
+            varlen_plan = self._mtp_varlen.plan(rates, min(budget, max(1, len(candidates) * (1 + K))))
         for seq in sorted(self.running, key=lambda s: s.num_output_tokens):
             if len(out.scheduled) >= max_seqs or budget <= 0:
                 break
             if seq.is_finished or seq.request_id in self._preempted_this_step:
                 continue  # 排序副本中的已抢占/已结束 seq
             # MTP：decode 行 = 1 fresh + K 验证行（乐观推进；提交时回滚未接受部分）
-            num_new = 1 + self.cfg.scheduler.nextn_draft_tokens
+            if varlen_plan is not None and seq.request_id in varlen_plan:
+                num_new = varlen_plan[seq.request_id]
+            else:
+                num_new = 1 + self.cfg.scheduler.nextn_draft_tokens
             ok = self._acquire_kv(seq, num_new_tokens=num_new, out=out)
             if not ok:
                 # 永不满足：自身足迹已超池（自抢占排除自身 → 无候选可抢）。
@@ -492,6 +514,7 @@ class Scheduler:
         for block_id in seq.block_table:
             self.block_mgr.release(block_id)
         seq.block_table = []
+        self._mtp_rates.pop(seq.request_id, None)  # varlen 状态清理
         if seq in self.running:
             self.running.remove(seq)
         try:
@@ -542,6 +565,16 @@ class Scheduler:
         n_keep = seq.num_blocks_for(seq.num_tokens_computed, self.block_size)
         while len(seq.block_table) > n_keep:
             self.block_mgr.release(seq.block_table.pop())
+
+    def update_mtp_accept(self, request_id: str, accept_probs: list[float]) -> None:
+        """引擎在验证后回灌接受概率 → 累乘率（varlen 调度输入）。
+
+        accept_probs[j] = 位置 j 的边际接受概率估计（mtp_verify 输出）；
+        rates[j] = Π_{k≤j}（DeepInfer 累乘语义）。varlen 关闭时无操作。
+        """
+        if self._mtp_varlen is None:
+            return
+        self._mtp_rates[request_id] = MtpVarlen.cumprod(accept_probs)
 
     def _check_stop(self, seq: Sequence, token: int) -> SequenceStatus | None:
         if seq.sampling.is_stop_token(token):
