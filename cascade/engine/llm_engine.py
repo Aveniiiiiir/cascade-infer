@@ -24,17 +24,33 @@ class LLMEngine:
     def __init__(
         self,
         engine_cfg: EngineConfig,
-        model_dir: str,
+        model_dir: str | None = None,
         device: str = "cuda",
         dtype=None,
         num_blocks: int | None = None,
+        draft_model=None,  # DraftModel 协议（MTP；None = 关闭）
+        model=None,  # 预构建模型（引擎级测试免 checkpoint）
+        model_cfg=None,
     ) -> None:
         import torch
 
+        from cascade.common.env import envs
+
         if dtype is None:
             dtype = torch.bfloat16
+        if draft_model is not None and engine_cfg.scheduler.nextn_draft_tokens == 0:
+            # 默认验证长度取 env（DeepInfer NEXTN_DECODE 默认 5；Cascade 默认 3）
+            engine_cfg.scheduler.nextn_draft_tokens = envs.CASCADE_NEXTN_DECODE
+            engine_cfg.runtime_max_model_len = (
+                engine_cfg.model.max_model_len
+                + 2 * engine_cfg.model.num_nextn_predict_layers * 0  # K 行已由 1+K 计入预算
+                + 1
+            )
         self.cfg = engine_cfg
-        self.runner = ModelRunner(engine_cfg, model_dir, device=device, dtype=dtype, num_blocks=num_blocks)
+        self.runner = ModelRunner(
+            engine_cfg, model_dir, device=device, dtype=dtype, num_blocks=num_blocks,
+            model=model, model_cfg=model_cfg, draft_model=draft_model,
+        )
         num_blocks = self.runner.cache.num_blocks
         self.block_mgr = BlockManager(num_blocks)
         prefix_cache = (
