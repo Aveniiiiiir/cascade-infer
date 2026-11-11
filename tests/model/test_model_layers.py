@@ -205,7 +205,7 @@ def test_moe_output_oracle(seed_everything):
     for t in range(T):
         for k in range(cfg.num_experts_per_tok):
             e = idx[t, k].item()
-            ref[t] += w[t, k] * moe.experts[e](x[t : t + 1])[0]
+            ref[t] += w[t, k] * moe.expert_ffn_ref(x[t : t + 1], e)[0]
     ref = ref + moe.shared_experts(x)
     torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-4)
 

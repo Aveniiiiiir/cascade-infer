@@ -1,8 +1,13 @@
 """MoE 层（DeepSeek V2 家族，noaux_tc sigmoid 路由）与 dense MLP。
 
-参考实现（逐专家循环）：正确性优先，fused Triton 路径（moe_align +
-fused_moe_gemm）Phase 2 后期替换。路由语义：
+专家权重以**堆叠张量**持有（w1/w3: [E, N, H]，w2: [E, H, N]）——分组
+GEMM kernel 按专家索引的要求（vLLM 同构）；HF checkpoint 的逐专家键
+（mlp.experts.E.gate_proj.weight）由加载器重映射到堆叠切片。
 
+fused 路径经 triton_ops.fused_experts（moe_align + 双分组 GEMM，全程无
+原子，浮点归约顺序固定）；无 triton/fp32 场景自动走逐专家参考路径。
+
+路由语义：
 - noaux_tc: 选取 top-k 用 scores + e_score_correction_bias（bias 只影响选择），
   权重取原始 scores；norm_topk_prob 时归一化；× routed_scaling_factor。
 - n_group > 0（V2.5/V3）：先组内选 topk_group 个组，再组外 top-k。
@@ -15,6 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from cascade.config import ModelConfig
+from cascade.model_executor.triton_ops.fused_moe import fused_experts
 
 
 class MLP(nn.Module):
@@ -60,10 +66,15 @@ class MoEGate(nn.Module):
             scores_for_choice = scores
         if self.n_group > 0:
             # 组内选组：每组取 max，再选 topk_group 个组；未选中组的 token 出局
-            group_scores = scores_for_choice.view(-1, self.n_group, self.n_routed_experts // self.n_group).max(dim=-1).values
+            group_size = self.n_routed_experts // self.n_group
+            view = scores_for_choice.view(-1, self.n_group, group_size)
+            group_scores = view.max(dim=-1).values
             group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
-            group_mask = torch.zeros_like(scores_for_choice.view(-1, self.n_group, self.n_routed_experts // self.n_group)).scatter_(1, group_idx.unsqueeze(-1).expand(-1, -1, self.n_routed_experts // self.n_group), 1.0)
-            scores_for_choice = scores_for_choice.view(-1, self.n_routed_experts) * group_mask.view(-1, self.n_routed_experts)
+            group_mask = torch.zeros_like(view).scatter_(
+                1, group_idx.unsqueeze(-1).expand(-1, -1, group_size), 1.0
+            )
+            scores_for_choice = view * group_mask
+            scores_for_choice = scores_for_choice.view(-1, self.n_routed_experts)
         topk_idx = torch.topk(scores_for_choice, k=self.topk, dim=-1, sorted=False)[1]  # [T,k]
         topk_weight = scores.gather(1, topk_idx)  # 权重取原始 scores（无 bias）
         if self.cfg.norm_topk_prob:
@@ -73,37 +84,33 @@ class MoEGate(nn.Module):
 
 
 class DeepseekMoE(nn.Module):
-    """HF 命名：gate / experts.E / shared_experts —— 加载器零映射。"""
+    """堆叠专家权重（加载器把 HF 的 mlp.experts.E.* 映射到 w1/w3/w2 切片）。"""
 
     def __init__(self, cfg: ModelConfig) -> None:
         super().__init__()
         self.cfg = cfg
         self.gate = MoEGate(cfg)
-        self.experts = nn.ModuleList(
-            [MLP(cfg.hidden_size, cfg.moe_intermediate_size) for _ in range(cfg.n_routed_experts)]
-        )
+        E, N, H = cfg.n_routed_experts, cfg.moe_intermediate_size, cfg.hidden_size
+        self.w1 = nn.Parameter(torch.empty(E, N, H))
+        self.w3 = nn.Parameter(torch.empty(E, N, H))
+        self.w2 = nn.Parameter(torch.empty(E, H, N))
+        for p in (self.w1, self.w3, self.w2):
+            nn.init.normal_(p, std=0.02)
         self.shared_experts = MLP(cfg.hidden_size, cfg.shared_intermediate_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         T = x.shape[0]
-        topk_idx, topk_weight = self.gate(x)  # [T,k]
-        out = torch.zeros_like(x)
-        # 参考路径：逐专家循环（正确、可读；fused 路径 Phase 2 后期）
-        flat_expert = topk_idx.flatten()  # [T*k]
-        for e in range(self.cfg.n_routed_experts):
-            token_rows, k_slots = torch.nonzero(flat_expert == e, as_tuple=True)
-            if token_rows.numel() == 0:
-                continue
-            rows = torch.unique(token_rows)
-            weights = torch.zeros(T, device=x.device, dtype=topk_weight.dtype)
-            weights[token_rows] = topk_weight[token_rows, k_slots]
-            expert_out = self.experts[e](x[rows])
-            out.index_add_(
-                0, rows,
-                expert_out.to(x.dtype) * weights[rows].to(x.dtype).unsqueeze(-1),
-            )
-        out = out + self.shared_experts(x)
-        return out
+        topk_idx, topk_weight = self.gate(x)  # [T,k] int64 / fp32
+        routed = fused_experts(
+            x, self.w1, self.w3, self.w2, topk_weight, topk_ids=topk_idx.to(torch.int32)
+        )
+        return routed + self.shared_experts(x)
+
+    # ------------------------------------------------------------------ 参考/调试
+
+    def expert_ffn_ref(self, x: torch.Tensor, expert: int) -> torch.Tensor:
+        """单专家 FFN（参考语义文档）。"""
+        return (F.silu(x @ self.w1[expert].T) * (x @ self.w3[expert].T)) @ self.w2[expert].T
 
 
 __all__ = ["MLP", "MoEGate", "DeepseekMoE"]
