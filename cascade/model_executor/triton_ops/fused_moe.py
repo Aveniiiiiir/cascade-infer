@@ -130,8 +130,13 @@ def fused_experts(
     block_m: int = _DEFAULT_BLOCK_M,
     block_n: int = _DEFAULT_BLOCK_N,
     block_k: int = _DEFAULT_BLOCK_K,
+    pad_to: int | None = None,  # 图捕获模式：sorted 布局固定尺寸（≥ 最坏填充）
 ) -> torch.Tensor:
-    """→ [T, H]（不含共享专家；调用方自行相加）。"""
+    """→ [T, H]（不含共享专家；调用方自行相加）。
+
+    pad_to 给定时为图捕获安全路径：moe_align 尺寸固定、grid 固定
+    （num_blocks 由 expert_ids 形状决定，无 .item() 同步）。
+    """
     assert x.ndim == 2 and w1.ndim == 3 and w2.ndim == 3
     T, H = x.shape
     E, N, H2 = w1.shape
@@ -143,8 +148,8 @@ def fused_experts(
         return fused_experts_ref(x, w1, w3, w2, topk_weight, topk_ids)
     K = topk_ids.shape[1]
     device = x.device
-    sorted_ids, expert_ids, _n_post = moe_align_block_size(topk_ids, E, block_m)
-    num_blocks = expert_ids.numel()
+    sorted_ids, expert_ids, _n_post = moe_align_block_size(topk_ids, E, block_m, pad_to=pad_to)
+    num_blocks = expert_ids.numel()  # 形状决定（图模式下固定）
     inter1 = torch.empty(T * K, 2 * N, dtype=x.dtype, device=device)
     inter2 = torch.empty(T * K, N, dtype=x.dtype, device=device)
     c2 = torch.empty(T * K, H, dtype=x.dtype, device=device)

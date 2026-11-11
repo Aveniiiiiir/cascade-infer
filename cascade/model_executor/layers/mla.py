@@ -106,6 +106,7 @@ class MLAAttention(nn.Module):
         cache: CacheEngine,
         rope: RotaryEmbedding,
         use_absorbed: bool = False,
+        num_splits: int | None = None,  # 图捕获时固定（避免 .item() 同步）
     ) -> torch.Tensor:
         # 1. 投影 + rope
         q_nope, q_rope = self.project_q(x)
@@ -117,7 +118,7 @@ class MLAAttention(nn.Module):
         # 3. 注意力
         if use_absorbed:
             out = self._forward_absorbed_batched(
-                q_nope, q_rope, positions, segment_lens, block_tables, cache
+                q_nope, q_rope, positions, seq_ids, segment_lens, block_tables, cache, num_splits
             )
         else:
             out = self._forward_explicit_loop(
@@ -158,14 +159,18 @@ class MLAAttention(nn.Module):
         q_nope: torch.Tensor,  # [T, h, 128]
         q_rope: torch.Tensor,  # [T, h, 64]（已 rope）
         positions: torch.Tensor,  # [T]
+        seq_ids: torch.Tensor,  # [T]
         segment_lens: list[int],
         block_tables: torch.Tensor,  # [n_seqs, max_blocks]
         cache: CacheEngine,
+        num_splits: int | None = None,
     ) -> torch.Tensor:
         """吸收路径批处理：多 token 段走 prefill kernel，单 token 段（decode）
         走 split-K decode kernel；kernel 按精度自动分发（fp32 → ref）。
 
         段与 block_tables 行 1:1（一个 seq 每步至多一个段）。
+        **图捕获安全**：纯 decode 批（segment_lens 全 1）走无 .item() 的
+        张量化路径（seqlens = positions + 1），num_splits 由图 runner 固定。
         """
         from cascade.model_executor.triton_ops.paged_mla_decode_attn import (
             paged_mla_decode_attn,
@@ -179,38 +184,53 @@ class MLAAttention(nn.Module):
         # q 吸收 W_UK：q_abs 与 latent c 点积（fp32 计算）
         q_abs = torch.einsum("thd,hdk->thk", q_nope.float(), self.u_k.float())
         q_full = torch.cat((q_abs, q_rope.float()), dim=-1).to(kv.dtype)  # [T, h, 576]
-        # 段偏移与每段 KV 上界（= 段首位置 + 段长；decode 段为 pos+1）
-        offsets = []
-        acc = 0
-        for n in segment_lens:
-            offsets.append(acc)
-            acc += n
-        assert acc == T
-        seqlens = torch.tensor(
-            [int(positions[o].item()) + n for o, n in zip(offsets, segment_lens)],
-            dtype=torch.int64,
-            device=kv.device,
-        )
+        all_decode = all(n == 1 for n in segment_lens)
         out_latent = torch.empty(T, self.num_heads, self.kv_lora, dtype=torch.float32, device=kv.device)
-        # ---- 多 token 段：prefill kernel（varlen 因果）----
-        multi_segs = [(i, int(positions[o].item()), n) for i, (o, n) in enumerate(zip(offsets, segment_lens)) if n > 1]
-        if multi_segs:
-            rows = torch.cat(
-                [torch.arange(offsets[i], offsets[i] + n, device=kv.device) for i, _, n in multi_segs]
+        if all_decode:
+            # ---- 纯 decode 批：图捕获安全（无 .item()）----
+            seqlens = positions.to(torch.int64) + 1
+            out_d = paged_mla_decode_attn(
+                q_full, kv, block_tables, seqlens, self.scale, self.kv_lora, num_splits=num_splits
             )
-            q_m = q_full.index_select(0, rows).contiguous()
-            out_latent[rows] = paged_mla_prefill_attn(
-                q_m, kv, block_tables, seqlens, multi_segs, self.scale, self.kv_lora
+            out_latent = out_d.to(torch.float32)
+        else:
+            # ---- 混合批（eager）：段偏移与每段 KV 上界 ----
+            offsets = []
+            acc = 0
+            for n in segment_lens:
+                offsets.append(acc)
+                acc += n
+            assert acc == T
+            seqlens = torch.tensor(
+                [int(positions[o].item()) + n for o, n in zip(offsets, segment_lens)],
+                dtype=torch.int64,
+                device=kv.device,
             )
-        # ---- 单 token 段（decode）：split-K kernel ----
-        decode_segs = [i for i, n in enumerate(segment_lens) if n == 1]
-        if decode_segs:
-            rows = torch.tensor([offsets[i] for i in decode_segs], device=kv.device)
-            q_d = q_full.index_select(0, rows).contiguous()
-            bt_d = block_tables.index_select(0, torch.tensor(decode_segs, device=kv.device))
-            sl_d = seqlens.index_select(0, torch.tensor(decode_segs, device=kv.device))
-            out_d = paged_mla_decode_attn(q_d, kv, bt_d, sl_d, self.scale, self.kv_lora)
-            out_latent[rows] = out_d.to(torch.float32)
+            # 多 token 段：prefill kernel（varlen 因果）
+            multi_segs = [
+                (i, int(positions[o].item()), n)
+                for i, (o, n) in enumerate(zip(offsets, segment_lens))
+                if n > 1
+            ]
+            if multi_segs:
+                rows = torch.cat(
+                    [torch.arange(offsets[i], offsets[i] + n, device=kv.device) for i, _, n in multi_segs]
+                )
+                q_m = q_full.index_select(0, rows).contiguous()
+                out_latent[rows] = paged_mla_prefill_attn(
+                    q_m, kv, block_tables, seqlens, multi_segs, self.scale, self.kv_lora
+                )
+            # 单 token 段（decode）：split-K kernel
+            decode_segs = [i for i, n in enumerate(segment_lens) if n == 1]
+            if decode_segs:
+                rows = torch.tensor([offsets[i] for i in decode_segs], device=kv.device)
+                q_d = q_full.index_select(0, rows).contiguous()
+                bt_d = block_tables.index_select(0, torch.tensor(decode_segs, device=kv.device))
+                sl_d = seqlens.index_select(0, torch.tensor(decode_segs, device=kv.device))
+                out_d = paged_mla_decode_attn(
+                    q_d, kv, bt_d, sl_d, self.scale, self.kv_lora, num_splits=num_splits
+                )
+                out_latent[rows] = out_d.to(torch.float32)
         # W_UV 上投影
         out = torch.einsum("thk,hdk->thd", out_latent, self.u_v.float())  # [T, h, 128] fp32
         return out.to(kv.dtype).reshape(T, self.num_heads * self.v_head)

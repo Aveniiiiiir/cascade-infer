@@ -69,6 +69,14 @@ class _EnvNamespace:
     #: execution via the three-segment step pipeline.
     ZERO_OVERHEAD_SCHEDULING = _EnvDescriptor("CASCADE_ZERO_OVERHEAD_SCHEDULING", int, 1)
 
+    # --- CUDA Graph ---------------------------------------------------------------
+    #: decode forward 图捕获（无 triton/fp32 环境自动关闭）。
+    CUDAGRAPH = _EnvDescriptor("CASCADE_CUDAGRAPH", int, 1)
+    #: 档位间隔（2 的幂到 8 后按此等差；DeepInfer interval 默认 8）。
+    CUDAGRAPH_BATCH_SIZE_INTERVAL = _EnvDescriptor("CASCADE_CUDAGRAPH_BATCH_SIZE_INTERVAL", int, 8)
+    #: 图内 decode 注意力的固定 split 数（避免 seqlens.max().item() 同步）。
+    CUDAGRAPH_NUM_SPLITS = _EnvDescriptor("CASCADE_CUDAGRAPH_NUM_SPLITS", int, 8)
+
     # --- misc -------------------------------------------------------------------
     #: regenerate golden files instead of comparing against them (tests only).
     REGEN_GOLDEN = _EnvDescriptor("CASCADE_REGEN_GOLDEN", int, 0)

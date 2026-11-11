@@ -26,6 +26,9 @@ def moe_align_block_size(
     block_size: int,
     pad_to: int | None = None,  # 输出固定尺寸（CUDA graph 捕获用；None=精确尺寸）
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """pad_to 给定时为**图捕获安全**路径：sorted/expert_ids 尺寸固定、
+    无 .item() 同步；超出实际填充的块经 searchsorted 得到安全范围内的
+    专家索引（其 sorted 槽位为 -1，kernel 侧掩码跳过）。"""
     assert topk_ids.ndim == 2
     assert block_size > 0 and num_experts > 0
     device = topk_ids.device
@@ -34,8 +37,14 @@ def moe_align_block_size(
     padded = (counts + block_size - 1) // block_size * block_size
     seg_end = padded.cumsum(0)  # 每专家段结束（含填充）
     seg_start = seg_end - padded
-    total_padded = int(seg_end[-1].item())
-    out_size = pad_to if pad_to is not None else total_padded
+    total_padded_t = seg_end[-1]  # 标量张量（图模式下不 .item()）
+    if pad_to is not None:
+        out_size = pad_to
+        num_blocks = (pad_to + block_size - 1) // block_size
+    else:
+        total_padded = int(total_padded_t.item())
+        out_size = total_padded
+        num_blocks = (total_padded + block_size - 1) // block_size
 
     # 稳定排序：专家升序、桶内 flat 序
     order = torch.argsort(flat, stable=True)  # [T*K]
@@ -46,7 +55,6 @@ def moe_align_block_size(
     sorted_token_ids = torch.full((out_size,), -1, dtype=torch.int32, device=device)
     sorted_token_ids[dest] = torch.arange(flat.numel(), dtype=torch.int32, device=device)
 
-    num_blocks = (total_padded + block_size - 1) // block_size
     if num_blocks > 0:
         block_starts = torch.arange(num_blocks, device=device) * block_size
         expert_ids = (
@@ -54,8 +62,7 @@ def moe_align_block_size(
         ).to(torch.int32)
     else:
         expert_ids = torch.empty(0, dtype=torch.int32, device=device)
-    num_tokens_post_pad = torch.tensor(total_padded, dtype=torch.int32, device=device)
-    return sorted_token_ids, expert_ids, num_tokens_post_pad
+    return sorted_token_ids, expert_ids, total_padded_t.to(torch.int32)
 
 
 def moe_align_ref(

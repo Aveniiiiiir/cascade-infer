@@ -97,12 +97,16 @@ class DeepseekMoE(nn.Module):
         for p in (self.w1, self.w3, self.w2):
             nn.init.normal_(p, std=0.02)
         self.shared_experts = MLP(cfg.hidden_size, cfg.shared_intermediate_size)
+        #: CUDA graph 捕获期由 graph runner 设置（固定 moe_align 尺寸；
+        #: 回放不跑 python，仅捕获期生效）
+        self.graph_pad_to: int | None = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         T = x.shape[0]
         topk_idx, topk_weight = self.gate(x)  # [T,k] int64 / fp32
         routed = fused_experts(
-            x, self.w1, self.w3, self.w2, topk_weight, topk_ids=topk_idx.to(torch.int32)
+            x, self.w1, self.w3, self.w2, topk_weight,
+            topk_ids=topk_idx.to(torch.int32), pad_to=self.graph_pad_to,
         )
         return routed + self.shared_experts(x)
 

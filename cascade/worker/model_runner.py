@@ -150,6 +150,20 @@ class ModelRunner:
             use_absorbed=self.use_absorbed,
         )
 
+    @staticmethod
+    def decode_batch_meta(n: int) -> ForwardBatch:
+        """纯 decode 批的采样元数据（launch_sample 只读 sample_flags /
+        segment_offsets / segment_lens 三个字段；CUDA graph 路径使用）。"""
+        return ForwardBatch(
+            input_ids=None,  # type: ignore[arg-type]
+            positions=None,  # type: ignore[arg-type]
+            seq_ids=None,  # type: ignore[arg-type]
+            segment_lens=[1] * n,
+            block_tables=None,  # type: ignore[arg-type]
+            sample_flags=[True] * n,
+            segment_offsets=list(range(n)),
+        )
+
     def launch_sample(
         self,
         logits: torch.Tensor,

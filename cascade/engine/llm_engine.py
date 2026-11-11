@@ -45,12 +45,40 @@ class LLMEngine:
         self.scheduler = Scheduler(engine_cfg, self.block_mgr, prefix_cache)
         self._request_counter = 0
         self._prev_sample = None  # 上一步的 SampleLaunch（ZOS 在途状态）
+        self.graph_runner = self._init_graph_runner(engine_cfg, device, dtype)
         _log.info(
-            "LLMEngine ready (ZOS 三段式): model=%s blocks=%d prefix_cache=%s",
+            "LLMEngine ready (ZOS 三段式): model=%s blocks=%d prefix_cache=%s cudagraph=%s",
             model_dir,
             num_blocks,
             prefix_cache is not None,
+            self.graph_runner is not None,
         )
+
+    def _init_graph_runner(self, engine_cfg, device, dtype):
+        import torch
+
+        from cascade.common.env import envs
+
+        if not envs.CASCADE_CUDAGRAPH:
+            return None
+        if not str(device).startswith("cuda") or dtype not in (torch.bfloat16, torch.float16):
+            return None
+        if not self.runner.cache or engine_cfg.scheduler.max_num_seqs < 1:
+            return None
+        from cascade.worker.cuda_graph_runner import CudaGraphRunner
+
+        # 预留 scratch 块（分配即持有；图 padding 行的 KV 写入目标）
+        scratch = self.block_mgr.allocate()
+        try:
+            return CudaGraphRunner(
+                self.runner.model, self.runner.cache, engine_cfg, device,
+                max_batch_size=engine_cfg.scheduler.max_num_seqs,
+                scratch_block=scratch,
+            )
+        except Exception:  # 图捕获失败（显存/驱动限制）→ 优雅降级 eager
+            self.block_mgr.release(scratch)
+            _log.warning("CUDA graph capture failed → fallback to eager", exc_info=True)
+            return None
 
     @property
     def model_cfg(self):
@@ -77,7 +105,8 @@ class LLMEngine:
     def step(self) -> list[RequestOutput]:
         """ZOS 三段式（对应 DeepInfer worker.py:89 的 Forward→PostProcess(prev)→Sample）：
 
-        1. schedule(N) + prepare + **launch** forward(N)（CPU 立即返回）
+        1. schedule(N) + prepare + **launch** forward(N)（CPU 立即返回；
+           纯 decode 批走 CUDA graph 回放）
         2. post_process(N−1)：唯一同步点 = 上一步采样事件 → 提交调度器
         3. launch sample(N) + 异步 D2H（留给下一步的 post_process）
 
@@ -88,11 +117,43 @@ class LLMEngine:
         if sched_out.is_empty:
             # 无新工作：冲刷上一步在途采样后返回
             return self._post_process_prev()
-        batch = self.runner.prepare_batch(sched_out)
-        logits = self.runner.forward(batch)  # 只 launch
+        graph_path = self._try_graph_forward(sched_out)
+        if graph_path is not None:
+            logits, batch = graph_path
+        else:
+            batch = self.runner.prepare_batch(sched_out)
+            logits = self.runner.forward(batch)  # 只 launch
         outputs = self._post_process_prev()  # 与 forward(N) GPU 执行重叠
         self._prev_sample = self.runner.launch_sample(logits, sched_out, batch)
         return outputs
+
+    def _try_graph_forward(self, sched_out):
+        """纯 decode 批且档位可容纳 → CUDA graph 回放。
+
+        Returns: (logits [n, vocab] bf16, decode 元数据 batch) 或 None。
+        """
+        import torch
+
+        if self.graph_runner is None:
+            return None
+        scheduled = sched_out.scheduled
+        n = len(scheduled)
+        if n == 0 or any(s.num_new_tokens != 1 for s in scheduled):
+            return None
+        if not self.graph_runner.can_run(n):
+            return None
+        tokens, positions, block_rows = [], [], []
+        for s in scheduled:
+            seq = s.seq
+            pos = seq.num_tokens_computed - 1
+            tokens.append(seq.token_at(pos))
+            positions.append(pos)
+            block_rows.append(seq.block_table)
+        hidden = self.graph_runner.replay(tokens, positions, block_rows)  # [T, H]
+        logits = self.runner.model.lm_head(hidden[:n])  # 图外一次 GEMM
+        # decode 元数据（launch_sample 只用这三个字段）
+        batch = self.runner.decode_batch_meta(n)
+        return logits, batch
 
     def _post_process_prev(self) -> list[RequestOutput]:
         if self._prev_sample is None:

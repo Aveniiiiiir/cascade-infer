@@ -38,10 +38,11 @@ class DeepseekV2DecoderLayer(nn.Module):
         cache: CacheEngine,
         rope: RotaryEmbedding,
         use_absorbed: bool = False,
+        num_splits: int | None = None,
     ) -> torch.Tensor:
         residual = x
         x = self.input_layernorm(x)
-        x = self.self_attn(x, positions, seq_ids, segment_lens, block_tables, cache, rope, use_absorbed)
+        x = self.self_attn(x, positions, seq_ids, segment_lens, block_tables, cache, rope, use_absorbed, num_splits)
         x = residual + x
         residual = x
         x = self.post_attention_layernorm(x)
@@ -70,11 +71,13 @@ class DeepseekV2Model(nn.Module):
         block_tables: torch.Tensor,  # [n_seqs, max_blocks]
         cache: CacheEngine,
         use_absorbed: bool = False,
+        num_splits: int | None = None,
     ) -> torch.Tensor:
         x = self.embed_tokens(input_ids)
         for layer in self.layers:
             x = layer(
-                x, positions, seq_ids, segment_lens, block_tables, cache, self.rope, use_absorbed
+                x, positions, seq_ids, segment_lens, block_tables, cache, self.rope,
+                use_absorbed, num_splits,
             )
         return self.norm(x)
 
@@ -95,12 +98,30 @@ class DeepseekV2ForCausalLM(nn.Module):
         block_tables: torch.Tensor,
         cache: CacheEngine,
         use_absorbed: bool = False,
+        num_splits: int | None = None,
     ) -> torch.Tensor:
         """→ logits [T, vocab]（完整行；采样器自行挑选各段末行/decode 行）。"""
         hidden = self.model(
-            input_ids, positions, seq_ids, segment_lens, block_tables, cache, use_absorbed
+            input_ids, positions, seq_ids, segment_lens, block_tables, cache, use_absorbed, num_splits
         )
         return self.lm_head(hidden)
+
+    def forward_hidden(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        seq_ids: torch.Tensor,
+        segment_lens: list[int],
+        block_tables: torch.Tensor,
+        cache: CacheEngine,
+        num_splits: int | None = None,
+    ) -> torch.Tensor:
+        """→ hidden [T, H]（不含 lm_head；CUDA graph 捕获入口——输出小，
+        lm_head 的一次 GEMM 留在图外以省各档位的 logits 显存）。"""
+        return self.model(
+            input_ids, positions, seq_ids, segment_lens, block_tables, cache,
+            use_absorbed=True, num_splits=num_splits,
+        )
 
     def tie_weights(self) -> None:
         if self.cfg.tie_word_embeddings:
