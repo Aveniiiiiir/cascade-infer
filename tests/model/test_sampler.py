@@ -180,3 +180,30 @@ def test_determinism_and_row_order(device: str) -> None:
     rows_p = _rows(device, [params[i].snapshot() for i in perm.tolist()], [17 * i for i in perm.tolist()])
     c = Sampler().sample(logits[perm].contiguous(), rows_p)
     assert c == [a[i] for i in perm.tolist()]
+
+
+@pytest.mark.parametrize("device", _devices())
+def test_sampling_distribution_goodness_of_fit(device: str) -> None:
+    """卡方 GoF：大样本经验频率 ≈ 变换后分布（KS 检验的等价验收）。"""
+    torch.manual_seed(9)
+    vocab = 64
+    T = 20_000
+    logits_row = torch.randn(vocab, dtype=torch.float32)
+    logits = logits_row.repeat(T, 1).to(device)
+    params = [
+        SamplingParams(temperature=1.0, top_p=0.95, top_k=-1, seq_seed=i, max_tokens=10)
+        for i in range(1)  # snapshot 共享（seed 逐行不同）
+    ]
+    per_row = [
+        (f"r{i}", params[0].snapshot(), i, -1) for i in range(T)
+    ]
+    rows = build_sampling_rows(per_row, device)
+    got = Sampler().sample(logits.clone(), rows)
+    counts = torch.bincount(torch.tensor(got, dtype=torch.long), minlength=vocab).float()
+    # 期望分布 = naive 变换后的 probs（独立 oracle）
+    probs = torch.softmax(logits_row / 1.0, dim=-1)
+    exp_probs = _naive_transform_row(logits_row, 1.0, -1, 0.95)
+    expected = torch.tensor(exp_probs, device=device) * T
+    chi2 = ((counts - expected) ** 2 / expected.clamp_min(1e-6)).sum().item()
+    # 自由度 ≈ vocab-1 = 63：均值 63，σ = sqrt(2*63) ≈ 11.2；5σ 上界
+    assert chi2 < 63 + 5 * (2 * 63) ** 0.5, f"卡方 {chi2:.1f} 超界（分布偏移）"

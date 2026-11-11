@@ -86,10 +86,21 @@ class LLMEngine:
     def generate(
         self,
         prompt_token_ids: list[list[int]],
-        sampling_params: SamplingParams | None = None,
+        sampling_params: SamplingParams | list[SamplingParams] | None = None,
     ) -> dict[str, list[int]]:
-        """离线批生成：所有请求跑完 → request_id → 输出 token 列表。"""
-        ids = [self.add_request(p, sampling_params) for p in prompt_token_ids]
+        """离线批生成：所有请求跑完 → request_id → 输出 token 列表。
+
+        sampling_params 可为单个（共享）或逐请求列表（批不变测试需要
+        每请求独立 seq_seed）。
+        """
+        if sampling_params is None:
+            sampling_params = SamplingParams()
+        if isinstance(sampling_params, SamplingParams):
+            params_list = [sampling_params] * len(prompt_token_ids)
+        else:
+            assert len(sampling_params) == len(prompt_token_ids)
+            params_list = list(sampling_params)
+        ids = [self.add_request(p, sp) for p, sp in zip(prompt_token_ids, params_list)]
         results: dict[str, list[int]] = {i: [] for i in ids}
         finish: dict[str, str] = {}
         while self.scheduler.has_unfinished_requests:
