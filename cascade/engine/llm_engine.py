@@ -74,13 +74,13 @@ class LLMEngine:
         return self.scheduler.has_unfinished_requests
 
     def step(self) -> list[RequestOutput]:
-        """一步：调度 → 准备 → 前向 → 贪心采样 → 提交（Phase 3 换确定性采样器）。"""
+        """一步：调度 → 准备 → 前向 → 确定性采样 → 提交。"""
         sched_out = self.scheduler.schedule()
         if sched_out.is_empty:
             return []
         batch = self.runner.prepare_batch(sched_out)
         logits = self.runner.forward(batch)
-        sampled = self.runner.sample_greedy_rows(logits, sched_out, batch)
+        sampled = self.runner.sample_rows(logits, sched_out, batch)
         return self.scheduler.update_from_output(sampled)
 
     def generate(

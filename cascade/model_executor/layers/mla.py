@@ -111,9 +111,9 @@ class MLAAttention(nn.Module):
         q_nope, q_rope = self.project_q(x)
         c, k_rope = self.project_kv(x)
         q_rope, k_rope = rope.apply(q_rope, k_rope, positions)
-        # 2. 写 paged KV：[c ‖ k_rope(已 rope)]
+        # 2. 写 paged KV：[c ‖ k_rope(已 rope)]（triton/ref 自动分发）
         latent = torch.cat((c, k_rope), dim=-1)  # [T, 576]
-        cache.store_latent_reference(self.layer_idx, latent, seq_ids, positions, block_tables)
+        cache.store_latent(self.layer_idx, latent, seq_ids, positions, block_tables)
         # 3. 分段注意力
         outs = []
         offset = 0

@@ -16,6 +16,7 @@ from cascade.config import CacheConfig, EngineConfig, ModelConfig
 from cascade.core.scheduler import SchedulerOutput
 from cascade.model_executor.model_loader import load_deepseek_v2
 from cascade.model_executor.models.deepseek_v2 import DeepseekV2ForCausalLM
+from cascade.sampling.sampler import Sampler, build_sampling_rows
 from cascade.worker.cache_engine import CacheEngine
 from cascade.worker.kv_layout import derive_num_blocks
 
@@ -38,7 +39,7 @@ class ForwardBatch:
 
 
 class ModelRunner:
-    __slots__ = ("engine_cfg", "model", "cfg", "cache", "device", "dtype", "use_absorbed")
+    __slots__ = ("engine_cfg", "model", "cfg", "cache", "device", "dtype", "use_absorbed", "sampler")
 
     def __init__(
         self,
@@ -53,6 +54,7 @@ class ModelRunner:
         self.device = device
         self.dtype = dtype
         self.use_absorbed = use_absorbed
+        self.sampler = Sampler()
         self.model, self.cfg = load_deepseek_v2(model_dir, device=device, dtype=dtype)
         if num_blocks is None:
             num_blocks = self._profile_num_blocks(engine_cfg.cache)
@@ -131,24 +133,41 @@ class ModelRunner:
             use_absorbed=self.use_absorbed,
         )
 
-    def sample_greedy_rows(
+    def sample_rows(
         self,
         logits: torch.Tensor,
         sched_out: SchedulerOutput,
         batch: ForwardBatch,
     ) -> dict[str, list[int]]:
-        """贪心采样：每段的最后一行（Phase 3 换确定性采样 fused kernel）。"""
-        rows = []
-        ids = []
-        for s, flag, off, n in zip(sched_out.scheduled, batch.sample_flags, batch.segment_offsets, batch.segment_lens):
+        """确定性采样（温度/top-p/top-k 变换 + det RNG；贪心经退化路径）。
+
+        每段的最后一行（decode 行或 prefill 收尾行）参与采样；
+        新 token 的绝对位置 = seq.num_tokens（update 追加前），
+        golden 索引 = seq.num_output_tokens（追加前）。
+        """
+        sel: list[tuple[str, object, int, int]] = []
+        rows_idx: list[int] = []
+        for s, flag, off, n in zip(
+            sched_out.scheduled, batch.sample_flags, batch.segment_offsets, batch.segment_lens
+        ):
             if not flag:
                 continue
-            rows.append(off + n - 1)
-            ids.append(s.seq.request_id)
-        if not rows:
+            seq = s.seq
+            rows_idx.append(off + n - 1)
+            sel.append(
+                (
+                    seq.request_id,
+                    seq.sampling,
+                    seq.num_tokens,
+                    seq.sampling.golden_at(seq.num_output_tokens),
+                )
+            )
+        if not sel:
             return {}
-        tokens = logits[rows].argmax(dim=-1).tolist()
-        return {rid: [int(t)] for rid, t in zip(ids, tokens)}
+        rows = build_sampling_rows(sel, self.device)
+        logits_rows = logits[rows_idx].to(torch.float32).contiguous()
+        tokens = self.sampler.sample(logits_rows, rows)
+        return {rid: [int(t)] for (rid, _, _, _), t in zip(sel, tokens)}
 
 
 __all__ = ["ModelRunner", "ForwardBatch"]

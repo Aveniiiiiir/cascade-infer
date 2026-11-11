@@ -48,10 +48,11 @@ class CacheEngine:
         """第 layer_idx 层的视图: [num_blocks, block_size, kv_cache_dim]。"""
         return self.kv_cache[layer_idx]
 
-    # ------------------------------------------------------------------ reference scatter/gather
-    # Triton kernel（store_paged_kv）的语义 oracle；Phase 2 GPU 上先走这条路径。
+    # ------------------------------------------------------------------ scatter/gather
+    # 写入路径经 triton_ops 分发（CUDA+triton → kernel；否则 PyTorch ref）。
+    # 读取参考路径保留在本文件（分页注意力 kernel 落地后由 kernel 直读替换）。
 
-    def store_latent_reference(
+    def store_latent(
         self,
         layer_idx: int,
         latent: torch.Tensor,  # [T, kv_cache_dim] 本步新 token 的 c‖rope
@@ -59,11 +60,10 @@ class CacheEngine:
         positions: torch.Tensor,  # [T] int64: 绝对位置
         block_tables: torch.Tensor,  # [n_seqs, max_blocks] int64
     ) -> None:
+        from cascade.model_executor.triton_ops.store_paged_kv import store_paged_kv
+
         kv = self.layer_view(layer_idx)
-        bs = self.cache_cfg.block_size
-        blocks = block_tables[seq_ids, torch.div(positions, bs, rounding_mode="floor")]
-        slots = positions % bs
-        kv[blocks, slots] = latent.to(kv.dtype)
+        store_paged_kv(kv, latent.to(kv.dtype), seq_ids, positions, block_tables)
 
     def gather_positions_reference(
         self,

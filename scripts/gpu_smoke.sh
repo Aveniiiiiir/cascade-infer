@@ -5,6 +5,6 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 pip install -e ".[dev,so]" -q
-python -m pytest tests/cpu tests/model -q
+python -m pytest tests/cpu tests/model tests/triton_ops -q
 
 echo "SMOKE OK"

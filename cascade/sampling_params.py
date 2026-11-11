@@ -34,9 +34,14 @@ class SamplingScalars:
     seq_seed: int
     ignore_eos: bool
     stop_token_ids: tuple[int, ...]
+    #: teacher-forcing 输出（测试/回放：第 output_len 个强制输出）
+    golden_token_ids: tuple[int, ...] = ()
 
     def is_stop_token(self, token_id: int) -> bool:
         return not self.ignore_eos and token_id in self.stop_token_ids
+
+    def golden_at(self, output_len: int) -> int:
+        return self.golden_token_ids[output_len] if output_len < len(self.golden_token_ids) else -1
 
 
 @dataclass
@@ -72,6 +77,7 @@ class SamplingParams:
             raise ValueError(f"top_p must be in (0, 1], got {self.top_p}")
 
     def snapshot(self) -> SamplingScalars:
+        golden = tuple(self.golden_token_ids) if self.golden_token_ids else ()
         return SamplingScalars(
             temperature=self.temperature,
             top_p=self.top_p,
@@ -80,6 +86,7 @@ class SamplingParams:
             seq_seed=self.seq_seed,
             ignore_eos=self.ignore_eos,
             stop_token_ids=self.stop_token_ids,
+            golden_token_ids=golden,
         )
 
     @property
