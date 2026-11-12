@@ -13,6 +13,7 @@ from cascade.core.prefix_cache import PrefixCache
 from cascade.core.scheduler import Scheduler
 from cascade.core.sequence import RequestOutput
 from cascade.sampling_params import SamplingParams
+from cascade.structured_output.builder import SOMatchersBuilder
 from cascade.worker.model_runner import ModelRunner
 
 _log = get_logger("engine.llm_engine")
@@ -61,6 +62,10 @@ class LLMEngine:
         self.scheduler = Scheduler(engine_cfg, self.block_mgr, prefix_cache)
         self._request_counter = 0
         self._prev_sample = None  # 上一步的 SampleLaunch（ZOS 在途状态）
+        #: SO：异步编译 builder + staging（编完才入调度）+ 失败输出缓冲
+        self._so_builder = SOMatchersBuilder()
+        self._so_staging: dict[str, tuple[list[int], SamplingParams]] = {}
+        self._so_failed_outputs: list[RequestOutput] = []
         self.graph_runner = self._init_graph_runner(engine_cfg, device, dtype)
         _log.info(
             "LLMEngine ready (ZOS 三段式): model=%s blocks=%d prefix_cache=%s cudagraph=%s",
@@ -112,6 +117,13 @@ class LLMEngine:
         if request_id is None:
             request_id = f"req-{self._request_counter}"
             self._request_counter += 1
+        if sampling_params.so_args:
+            # SO：异步编译，编完才入调度（DeepInfer 编译不阻塞调度热路径）
+            self._so_staging[request_id] = (prompt_token_ids, sampling_params)
+            self._so_builder.submit(
+                request_id, sampling_params.so_args, self.cfg.model.vocab_size
+            )
+            return request_id
         self.scheduler.add_request(request_id, prompt_token_ids, sampling_params, has_so=has_so)
         return request_id
 
@@ -129,6 +141,8 @@ class LLMEngine:
         GPU 跑 forward(N)→sample(N) 的同时，CPU 并发跑 schedule(N+1) 前的
         提交与产出逻辑 —— 调度与执行重叠，无空泡。
         """
+        self._pump_so()
+        self._drain_so_failures()
         sched_out = self.scheduler.schedule()
         if sched_out.is_empty:
             # 无新工作：冲刷上一步在途采样后返回
@@ -171,13 +185,51 @@ class LLMEngine:
         batch = self.runner.decode_batch_meta(n)
         return logits, batch
 
+    def _pump_so(self) -> None:
+        """收割 SO 编译结果：成功的入调度 + 挂 matcher；失败的直接判死
+        （staged 请求从未入队 → 合成 FINISHED_SO_FAILED 输出）。"""
+        if not self._so_staging and self._so_builder.num_pending == 0:
+            return
+        for result in self._so_builder.pump():
+            staged = self._so_staging.pop(result.request_id, None)
+            if staged is None:
+                continue  # 已被 abort 等移除
+            prompt, sp = staged
+            if result.matcher is None:
+                self._so_failed_outputs.append(
+                    RequestOutput(
+                        request_id=result.request_id,
+                        new_token_ids=[],
+                        output_token_ids=[],
+                        finish_reason="so_failed",
+                    )
+                )
+                continue
+            self.runner.attach_so_matcher(result.request_id, result.matcher)
+            self.scheduler.add_request(result.request_id, prompt, sp, has_so=True)
+
+    def _drain_so_failures(self) -> None:
+        """在途 SO 失败（掩码/接受异常）→ 判死本请求，引擎继续。"""
+        for rid in self.runner.so_failed_requests:
+            self.runner.detach_so_matcher(rid)
+            self.scheduler.fail_so(rid)
+
     def _post_process_prev(self) -> list[RequestOutput]:
+        outputs: list[RequestOutput] = list(self._so_failed_outputs)
+        self._so_failed_outputs.clear()
         if self._prev_sample is None:
-            return []
+            return outputs
         launch = self._prev_sample
         self._prev_sample = None
         sampled = launch.wait_tokens()  # 唯一 CPU-GPU 同步点
-        return self.scheduler.update_from_output(sampled)
+        outputs.extend(self.scheduler.update_from_output(sampled))
+        # SO：统一推进 matcher 真实状态（MTP/普通行）；结束的 seq 卸载
+        for ro in outputs:
+            if ro.new_token_ids:
+                self.runner.accept_so_committed(ro.request_id, ro.new_token_ids)
+            if ro.finish_reason is not None:
+                self.runner.detach_so_matcher(ro.request_id)
+        return outputs
 
     def generate(
         self,
@@ -199,7 +251,7 @@ class LLMEngine:
         ids = [self.add_request(p, sp) for p, sp in zip(prompt_token_ids, params_list)]
         results: dict[str, list[int]] = {i: [] for i in ids}
         finish: dict[str, str] = {}
-        while self.scheduler.has_unfinished_requests:
+        while self.scheduler.has_unfinished_requests or self._so_staging:
             for ro in self.step():
                 results[ro.request_id].extend(ro.new_token_ids)
                 if ro.finish_reason is not None:

@@ -19,6 +19,7 @@ from cascade.model_executor.model_loader import load_deepseek_v2
 from cascade.model_executor.models.deepseek_v2 import DeepseekV2ForCausalLM
 from cascade.sampling.confidence import ConfidenceCalibrator
 from cascade.sampling.sampler import Sampler, build_sampling_rows
+from cascade.structured_output.matcher import SOMatcher  # noqa: F401  (类型引用)
 from cascade.worker.cache_engine import CacheEngine
 from cascade.worker.kv_layout import derive_num_blocks
 
@@ -98,6 +99,9 @@ class ModelRunner:
         self.draft_model = draft_model
         self._mtp_drafts: dict[str, "DraftInfo"] = {}
         self.calibrator = ConfidenceCalibrator()
+        #: SO：matcher 句柄 + 本步失败集合（失败隔离）
+        self._so_matchers: dict[str, "SOMatcher"] = {}
+        self._so_failed: set[str] = set()
         if model is not None:
             assert model_cfg is not None
             self.model, self.cfg = model, model_cfg
@@ -192,6 +196,73 @@ class ModelRunner:
             use_absorbed=self.use_absorbed,
         )
 
+    # ------------------------------------------------------------------ SO
+
+    def attach_so_matcher(self, request_id: str, matcher: SOMatcher) -> None:
+        self._so_matchers[request_id] = matcher
+
+    def detach_so_matcher(self, request_id: str) -> None:
+        self._so_matchers.pop(request_id, None)
+        self._so_failed.discard(request_id)
+
+    @property
+    def so_failed_requests(self) -> list[str]:
+        return list(self._so_failed)
+
+    def _fill_mask_row(self, matcher: SOMatcher, words: list[int]) -> None:
+        """terminated → 全开（DeepInfer EOS 后全开语义）。"""
+        if matcher.terminated:
+            matcher.fill_ones(words)
+        else:
+            matcher.fill_mask_into(words)
+
+    def _build_plain_so_masks(self, plain_sel: list) -> tuple[object, object] | None:
+        """普通采样行的位掩码：行 0 = 全 1（无约束）；SO 行 1..。
+        Returns: (so_bitmask GPU int32 [rows, words], row_map int32) 或 None。"""
+        import torch as _torch
+
+        so_idx: dict[str, int] = {}
+        rows: list[list[int]] = [[-1] * self._so_words]  # 行 0：全 1
+        for rid, _scalars, _pos, _golden in plain_sel:
+            m = self._so_matchers.get(rid)
+            if m is None or m.status == -1:
+                continue
+            row = [0] * self._so_words
+            try:
+                self._fill_mask_row(m, row)
+            except Exception:  # 失败隔离
+                self._so_failed.add(rid)
+                m.status = -1
+                continue
+            so_idx[rid] = len(rows)
+            rows.append(row)
+        if not so_idx:
+            return None
+        row_map = _torch.tensor(
+            [so_idx.get(rid, 0) for rid, _, _, _ in plain_sel],
+            dtype=_torch.int32,
+            device=self.device,
+        )
+        bitmask = _torch.tensor(rows, dtype=_torch.int32, device=self.device)
+        return bitmask, row_map
+
+    @property
+    def _so_words(self) -> int:
+        return (self.cfg.vocab_size + 31) // 32
+
+    def accept_so_committed(self, request_id: str, tokens: list[int]) -> None:
+        """post_process 时推进 matcher 真实状态（MTP/普通行统一入口）。"""
+        m = self._so_matchers.get(request_id)
+        if m is None or m.status == -1:
+            return
+        try:
+            for t in tokens:
+                m.accept_token(int(t))
+            m.status = 2
+        except Exception:
+            self._so_failed.add(request_id)
+            m.status = -1
+
     @staticmethod
     def decode_batch_meta(n: int) -> ForwardBatch:
         """纯 decode 批的采样元数据（launch_sample 只读 sample_flags /
@@ -258,7 +329,11 @@ class ModelRunner:
         if plain_sel:
             rows = build_sampling_rows(plain_sel, self.device)
             logits_rows = logits[plain_rows].to(torch.float32).contiguous()
-            tokens = self.sampler.sample_tensors(logits_rows, rows)
+            so = self._build_plain_so_masks(plain_sel)
+            if so is not None:
+                tokens = self.sampler.sample_tensors(logits_rows, rows, so_bitmask=so[0], so_row_map=so[1])
+            else:
+                tokens = self.sampler.sample_tensors(logits_rows, rows)
             is_cuda = str(self.device).startswith("cuda")
             pinned = torch.empty(
                 tokens.shape, dtype=torch.int32, device="cpu", pin_memory=is_cuda
@@ -287,15 +362,21 @@ class ModelRunner:
     # ------------------------------------------------------------------ MTP
 
     def _verify_mtp_seq(self, logits: torch.Tensor, s, seq_seed: int) -> list[int]:
-        """单 seq 的 MTP 验证：logits 段 [1+K, V] + 上轮草案 → 提交 token。"""
+        """单 seq 的 MTP 验证：logits 段 [1+K, V] + 上轮草案 → 提交 token。
+
+        SO 集成（DeepInfer matcher.py:366-376 语义）：行 j 的掩码 = 试探性
+        接受 d_0..d_{j-1} 后的状态；bonus 行 = 全接受态；填完回滚全部试探
+        （真实状态由 post_process 的 committed 统一推进——见
+        accept_so_committed）。掩码在 log_softmax 之前施加于 logits。
+        """
         from cascade.sampling.mtp_verify import mtp_verify
         from cascade.sampling.rng import derive_uniform
+        from cascade.model_executor.triton_ops.apply_so_bitmask import apply_token_bitmask
         from cascade.model_executor.triton_ops.common import CASE_SAMPLE, CASE_VERIFY
 
         seq = s.seq
         off = seq.num_tokens_computed - s.num_new_tokens  # 段首（本 runner 批内偏移）
         rows = logits[off : off + s.num_new_tokens].to(torch.float32)
-        lp = torch.log_softmax(rows, dim=-1)
         K_actual = s.num_new_tokens - 1
         draft = self._mtp_drafts.pop(seq.request_id, None)
         P = seq.num_tokens - 1  # 输入首行（已提交末 token）的绝对位置
@@ -303,9 +384,30 @@ class ModelRunner:
         if draft is not None and len(draft.tokens) == K_actual and K_actual > 0:
             d_tokens = torch.tensor(draft.tokens, dtype=torch.int64, device=dev)
             d_lp = draft.logprobs
+            d_list = list(draft.tokens)
         else:
             d_tokens = torch.full((K_actual,), -1, dtype=torch.int64, device=dev)
             d_lp = torch.zeros(K_actual, logits.shape[-1], dtype=torch.float32, device=dev)
+            d_list = None
+        # ---- SO 多步试探掩码 ----
+        matcher = self._so_matchers.get(seq.request_id)
+        if matcher is not None and matcher.status != -1:
+            try:
+                words = self._so_words
+                masks = [[0] * words for _ in range(s.num_new_tokens)]
+                for j in range(K_actual):
+                    self._fill_mask_row(matcher, masks[j])
+                    matcher.accept_token(d_list[j] if d_list is not None else 0)
+                if K_actual > 0:
+                    self._fill_mask_row(matcher, masks[K_actual])  # bonus 行（全接受态）
+                    matcher.rollback(K_actual)
+                bitmask = torch.tensor(masks, dtype=torch.int32, device=dev)
+                row_map = torch.arange(s.num_new_tokens, dtype=torch.int32, device=dev)
+                apply_token_bitmask(rows, bitmask, row_map)  # log_softmax 之前
+            except Exception:
+                self._so_failed.add(seq.request_id)
+                matcher.status = -1
+        lp = torch.log_softmax(rows, dim=-1)
         accept_u = torch.tensor(
             [derive_uniform(seq_seed, P + j + 1, CASE_VERIFY) for j in range(K_actual)],
             dtype=torch.float32,

@@ -566,6 +566,15 @@ class Scheduler:
         while len(seq.block_table) > n_keep:
             self.block_mgr.release(seq.block_table.pop())
 
+    def fail_so(self, request_id: str) -> bool:
+        """SO 失败隔离（DeepInfer FINISHED_SO_FAILED 语义）：判死本请求，
+        引擎继续。"""
+        seq = self._find(request_id)
+        if seq is None or seq.is_finished:
+            return False
+        self._finish_sequence(seq, SequenceStatus.FINISHED_SO_FAILED)
+        return True
+
     def update_mtp_accept(self, request_id: str, accept_probs: list[float]) -> None:
         """引擎在验证后回灌接受概率 → 累乘率（varlen 调度输入）。
 
