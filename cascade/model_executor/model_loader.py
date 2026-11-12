@@ -57,16 +57,15 @@ def load_deepseek_v2(
     model_dir = Path(model_dir)
     hf_dict = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
     cfg = ModelConfig.from_hf_dict(hf_dict)
-    if "quantization_config" in hf_dict:
-        raise NotImplementedError(
-            "FP8 checkpoint（DeepSeek-V3）反量加载在 Phase 6；当前请用 V2/V2-Lite bf16 checkpoint"
-        )
+    fp8_mode = "quantization_config" in hf_dict  # V3 原生 FP8：加载期反量化到 bf16
 
     model = DeepseekV2ForCausalLM(cfg, device="cpu")
     files = _shard_files(model_dir)
     state: dict[str, torch.Tensor] = {}
     for f in files:
         state.update(safetensors.torch.load_file(str(f)))
+    if fp8_mode:
+        state = _dequant_fp8_state(state)
     report = _assign(model, state, dtype)
     if cfg.tie_word_embeddings:
         model.tie_weights()
@@ -85,6 +84,40 @@ def load_deepseek_v2(
         for name in report.unexpected[:10]:
             _log.warning("unexpected: %s", name)
     return model, cfg
+
+
+def _dequant_fp8_state(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """V3 原生 FP8 checkpoint 的加载期反量化（Phase 6 先行路径）。
+
+    DeepSeek-V3 格式：权重 float8_e4m3fn + ``<name>_scale_inv``
+    [N/128, H/128]（128×128 blockwise）。反量化到 bf16（内存 2×，
+    正确性优先；``torch._scaled_mm`` 的在线 fp8 路径后置替换）。
+    fp16/bf16 权重原样通过（mixed checkpoint 的 norm 等）。
+    """
+    out: dict[str, torch.Tensor] = {}
+    for key, tensor in state.items():
+        if key.endswith("weight_scale_inv"):
+            continue  # 尺度已被消费（随其权重键）
+        if tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            scale_key = f"{key}_scale_inv"
+            scale = state.get(scale_key)
+            if scale is None:
+                _log.warning("FP8 权重 %s 缺少 %s，按 scale=1 反量化", key, scale_key)
+                out[key] = tensor.to(torch.bfloat16)
+                continue
+            out[key] = _dequant_blockwise(tensor, scale)
+        else:
+            out[key] = tensor
+    return out
+
+
+def _dequant_blockwise(w: torch.Tensor, scale: torch.Tensor, block: int = 128) -> torch.Tensor:
+    """[N, H] fp8 × [N/128, H/128] 尺度 → bf16。"""
+    N, H = w.shape
+    assert N % block == 0 and H % block == 0, f"非 128 对齐 fp8 权重 {tuple(w.shape)}"
+    s = scale.to(torch.float32)
+    s = s.repeat_interleave(block, dim=0).repeat_interleave(block, dim=1)  # [N, H]
+    return (w.to(torch.float32) * s).to(torch.bfloat16)
 
 
 def _assign(model: torch.nn.Module, state: dict[str, torch.Tensor], dtype: torch.dtype) -> LoadReport:
