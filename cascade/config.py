@@ -5,8 +5,8 @@ scheduler stack (`cascade.core`) depends only on the pieces it needs — this
 keeps the scheduler testable on Windows without a GPU or torch.cuda.
 
 `ModelConfig.from_hf_dict` parses a HuggingFace `config.json` for the
-DeepSeek-V2 family (V2 / V2-Lite / V2.5; V3 parsing extends this in
-`model_executor/models/deepseek_v3.py` later).
+DeepSeek-V2 family (V2 / V2-Lite)。deepseek_v3 显式拒绝（关键数学未实现，
+见 from_hf_dict；V3 支持落地于 `model_executor/models/deepseek_v3.py`）。
 """
 
 from __future__ import annotations
@@ -104,8 +104,16 @@ class ModelConfig:
         `deepseek_v3.py` 的扩展解析。
         """
         model_type = d.get("model_type", "deepseek_v2")
-        if model_type not in ("deepseek_v2", "deepseek_v3"):
-            raise ValueError(f"unsupported model_type {model_type!r} (仅支持 deepseek_v2/v3 家族)")
+        if model_type != "deepseek_v2":
+            # 审查 #8：V3 的 n_group 组路由 / rope beta 缩放 / nextn 权重映射均未
+            # 实现，接受它会造成静默错误的输出（路由与位置编码数学全错）——
+            # 显式拒绝而不是半支持。V3 支持落地于 model_executor/models/deepseek_v3.py。
+            if model_type == "deepseek_v3":
+                raise NotImplementedError(
+                    "deepseek_v3 家族暂不支持：n_group 组路由 / rope beta(mscale) / "
+                    "nextn 权重映射未实现（当前仅支持 deepseek_v2 = V2/V2-Lite）"
+                )
+            raise ValueError(f"unsupported model_type {model_type!r} (仅支持 deepseek_v2)")
         cfg = cls(
             model_type=model_type,
             max_model_len=int(d.get("max_position_embeddings", 4096)),
@@ -219,7 +227,10 @@ class EngineConfig:
             f"prefill_sum_seqlen_k ({self.scheduler.prefill_sum_seqlen_k}) 必须 >= "
             f"max_model_len ({self.model.max_model_len})"
         )
-        # 位置余量：投机解码需要 max_model_len 之外再容纳 K+1 个回退位置
-        # (DeepInfer: runtime_max_model_len = max_model_len + 2*nextn + 1)。
+        # 位置余量：投机解码需要 max_model_len 之外再容纳 K 个草案位置 + 1 个
+        # 回退位（DeepInfer: runtime_max_model_len = max_model_len + 2*nextn + 1；
+        # Cascade 的 decode 行预算 = 1+K，K 个草案位置同样要计入 —— 审查 #19
+        # 修正：原式漏掉 K，MTP 末步位置可达 max+K-1 越过 runtime）。
         nextn = self.model.num_nextn_predict_layers
-        self.runtime_max_model_len = self.model.max_model_len + 2 * nextn + 1
+        k = self.scheduler.nextn_draft_tokens
+        self.runtime_max_model_len = self.model.max_model_len + 2 * nextn + k + 1

@@ -17,6 +17,7 @@ from cascade.sampling.rng import (
     CASE_VERIFY,
     derive_uniform,
     derive_uniform_nextn,
+    random_sampling_ref,
     random_sampling_ref_pure,
     sample_cdf_inverse,
     splitmix64_to_uniform,
@@ -144,7 +145,7 @@ def test_torch_ref_bit_identical() -> None:
     # 零概率列注入
     probs[:, ::7] = 0.0
     probs = probs / probs.sum(dim=-1, keepdim=True)
-    seeds = torch.randint(0, 2**63, (rows,), dtype=torch.int64)
+    seeds = torch.randint(0, 2**63 - 1, (rows,), dtype=torch.int64)
     positions = torch.randint(0, 2**31, (rows,), dtype=torch.int64)
 
     got_torch = random_sampling_ref(probs, seeds, positions).tolist()
@@ -173,7 +174,7 @@ def test_torch_ref_row_order_invariant() -> None:
     rows, vocab = 128, 512
     probs = torch.rand(rows, vocab).double()
     probs = probs / probs.sum(dim=-1, keepdim=True)
-    seeds = torch.randint(0, 2**63, (rows,), dtype=torch.int64)
+    seeds = torch.randint(0, 2**63 - 1, (rows,), dtype=torch.int64)
     positions = torch.arange(rows, dtype=torch.int64) * 37
 
     base = random_sampling_ref(probs, seeds, positions)
@@ -191,7 +192,7 @@ def test_torch_ref_zero_prob_never() -> None:
     probs = torch.rand(512, vocab).double()
     probs[:, ::5] = 0.0
     probs = probs / probs.sum(dim=-1, keepdim=True)
-    seeds = torch.randint(0, 2**63, (512,), dtype=torch.int64)
+    seeds = torch.randint(0, 2**63 - 1, (512,), dtype=torch.int64)
     positions = torch.arange(512, dtype=torch.int64)
     out = random_sampling_ref(probs, seeds, positions)
     for i in range(512):

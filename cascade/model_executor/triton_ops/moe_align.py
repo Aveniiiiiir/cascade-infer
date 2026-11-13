@@ -33,23 +33,37 @@ def moe_align_block_size(
     assert block_size > 0 and num_experts > 0
     device = topk_ids.device
     flat = topk_ids.reshape(-1).to(torch.int64)
-    counts = torch.bincount(flat, minlength=num_experts)  # [E]
+    # 审查补充：torch.bincount（CUDA 实现）内部对输入取 max 做 D2H 同步来
+    # 确定输出长度——图捕获区间内的同步会 invalidate capture。改用定形状
+    # 的 scatter_add_（专家数 E 已知），eager 语义不变。
+    counts = torch.zeros(num_experts, dtype=torch.int64, device=device)
+    counts.scatter_add_(0, flat, torch.ones_like(flat))
     padded = (counts + block_size - 1) // block_size * block_size
     seg_end = padded.cumsum(0)  # 每专家段结束（含填充）
     seg_start = seg_end - padded
     total_padded_t = seg_end[-1]  # 标量张量（图模式下不 .item()）
     if pad_to is not None:
-        out_size = pad_to
         num_blocks = (pad_to + block_size - 1) // block_size
+        # out_size 必须向上取整到 block_size 的倍数——pad_to（如 132）非
+        # 倍数时最后一个块的 offs_m 越界（gemm 的 sorted_token_ids 加载）
+        out_size = num_blocks * block_size
     else:
         total_padded = int(total_padded_t.item())
         out_size = total_padded
         num_blocks = (total_padded + block_size - 1) // block_size
 
-    # 稳定排序：专家升序、桶内 flat 序
-    order = torch.argsort(flat, stable=True)  # [T*K]
-    counts_prefix = counts.cumsum(0) - counts  # 每专家的 token 起始序号
-    rank_in_expert = torch.arange(flat.numel(), device=device) - counts_prefix[flat]
+    # 稳定排序：专家升序、桶内 flat 序。
+    # rank_in_expert（flat 序下每个元素在其专家内的出现序号）：
+    # arange[cum-1] 在 counts>0 处差集展开 = 各专家桶内 0..c_e-1 的升序 rank。
+    # 旧实现 counts_prefix[flat] 是「每专家的 flat 起始序号」而非 rank——
+    # 专家分散时 dest 大量碰撞（328/512 存活），sorted_token_ids 被覆盖。
+    counts_prefix = counts.cumsum(0) - counts  # 每专家在排序后序列中的起始位置
+    order = torch.argsort(flat, stable=True)  # [T*K]：专家升序 + 桶内 flat 序
+    # 排序后位置的桶内 rank = arange - 每专家起始位置（排序后的前缀）
+    rank_sorted = torch.arange(flat.numel(), device=device) - counts_prefix[flat[order]]
+    # 反映射回 flat 序：rank_in_expert[order[i]] = rank_sorted[i]
+    rank_in_expert = torch.empty_like(rank_sorted)
+    rank_in_expert[order] = rank_sorted
     dest = seg_start[flat] + rank_in_expert
 
     sorted_token_ids = torch.full((out_size,), -1, dtype=torch.int32, device=device)

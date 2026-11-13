@@ -221,7 +221,8 @@ def _run_model(
 ) -> torch.Tensor:
     """按段跑一次 forward → 拼接 logits [T, vocab]。
 
-    block 表简化：每段（seq 行）从块 1 开始顺序分配 ceil(段末位置/bs)+1 个。
+    block 表：同一逻辑 seq（start_positions 连续的多个 chunk）共享 block 段
+    （后续 chunk 复用前面的 block）；不同 seq 的 block 段错开（共享 KV 池）。
     """
     dev = cache.device
     bs = cache.cache_cfg.block_size
@@ -237,12 +238,29 @@ def _run_model(
     seq_ids = torch.cat(
         [torch.full((segment_lens[i],), i, dtype=torch.int64, device=dev) for i in range(seq_rows)]
     )
-    need = [
-        (start_positions[i] + segment_lens[i] + bs - 1) // bs + 1 for i in range(seq_rows)
-    ]
-    bt = torch.zeros(seq_rows, max(need) + 1, dtype=torch.int64, device=dev)
+    # 逻辑 seq 分组：start_positions[i] == 前一 chunk 的 end ⇒ 同一逻辑 seq 的
+    # 后续 chunk（chunked prefill），共享其 block 段；否则新逻辑 seq。
+    logical: list[int] = []  # 每行 → 逻辑 seq 编号
+    end_of: list[int] = []   # 每逻辑 seq 已覆盖到的位置
     for i in range(seq_rows):
-        bt[i, : need[i]] = torch.arange(1, need[i] + 1, device=dev)
+        sp = start_positions[i]
+        if logical and sp == end_of[logical[-1]]:
+            logical.append(logical[-1])
+            end_of[-1] = sp + segment_lens[i]
+        else:
+            logical.append(len(end_of))
+            end_of.append(sp + segment_lens[i])
+    # 每逻辑 seq 的 block 段（按最终覆盖长度分配，连续编号、跨 seq 错开）
+    need_per_logical = [(end + bs - 1) // bs + 1 for end in end_of]
+    bt = torch.zeros(seq_rows, max(need_per_logical) + 1, dtype=torch.int64, device=dev)
+    offset = 1
+    logical_blocks: list[torch.Tensor] = []
+    for n in need_per_logical:
+        logical_blocks.append(torch.arange(offset, offset + n, device=dev))
+        offset += n
+    for i in range(seq_rows):
+        n = (start_positions[i] + segment_lens[i] + bs - 1) // bs + 1
+        bt[i, :n] = logical_blocks[logical[i]][:n]
     return model(flat, positions, seq_ids, segment_lens, bt, cache)
 
 

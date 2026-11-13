@@ -23,9 +23,11 @@ def test_wrapper_matches_ref(device: str) -> None:
     topk = torch.randint(0, E, (T, K), generator=g, dtype=torch.int32).to(device)
     a = moe_align_block_size(topk, E, bs)
     b = moe_align_ref(topk, E, bs)
-    assert torch.equal(a[0], b[0]), "sorted_token_ids 不一致"
-    assert torch.equal(a[1], b[1]), "expert_ids 不一致"
-    assert torch.equal(a[2], b[2]), "num_tokens_post_pad 不一致"
+    # ref 返回 CPU 张量；cuda 路径下需搬到同设备再比较
+    dev = a[0].device
+    assert torch.equal(a[0], b[0].to(dev)), "sorted_token_ids 不一致"
+    assert torch.equal(a[1], b[1].to(dev)), "expert_ids 不一致"
+    assert torch.equal(a[2].cpu(), b[2]), "num_tokens_post_pad 不一致"
 
 
 @pytest.mark.parametrize("device", _devices())

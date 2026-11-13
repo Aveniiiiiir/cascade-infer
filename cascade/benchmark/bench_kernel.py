@@ -48,12 +48,15 @@ def bench_store_kv() -> dict:
 
 
 def bench_decode_attn() -> dict:
-    n_seqs, seqlen, bs, num_blocks = 256, 4096, 64, 4096
+    n_seqs, seqlen, bs = 256, 4096, 64
+    # 池大小必须覆盖 n_seqs × seqlen/bs 个块（此前写死 4096，块 id 越界 →
+    # illegal memory access；审查补充：块表测试数据需与池容量自洽）
+    num_blocks = n_seqs * (seqlen // bs) + 1
     q = torch.randn(n_seqs, H, D, dtype=torch.bfloat16, device="cuda") * 0.05
     kv = torch.randn(num_blocks, bs, D, dtype=torch.bfloat16, device="cuda") * 0.05
     bt = torch.zeros(n_seqs, seqlen // bs, dtype=torch.int64, device="cuda")
     for i in range(n_seqs):
-        bt[i] = torch.arange(i * 64 + 1, i * 64 + 65, device="cuda")
+        bt[i] = torch.arange(i * (seqlen // bs) + 1, (i + 1) * (seqlen // bs) + 1, device="cuda")
     sl = torch.full((n_seqs,), seqlen, dtype=torch.int64, device="cuda")
     ms = bench(lambda: paged_mla_decode_attn(q, kv, bt, sl, SCALE, KV_LORA))
     # KV 加载为带宽下界：n_seqs × seqlen × D × 2B

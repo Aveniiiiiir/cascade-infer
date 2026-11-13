@@ -45,12 +45,17 @@ def test_greedy_equivalence(device: str) -> None:
     torch.manual_seed(1)
     K = 4
     logits = [l.to(device) for l in _make_target(7, K + 2)]
-    target_lp = torch.stack([torch.log_softmax(l, dim=-1) for l in logits[: K + 1]])
-    # 贪心草案：交替对/错（对 = 目标 argmax；错 = argmax+1）
+    # 贪心 target = one-hot（log_softmax 后 argmax 位为 0，其余远小于 0）。
+    # 拒绝采样的「对就必接受」要求 target 也是 one-hot：q_lp[argmax]=0 =
+    # p_lp[argmax] → ratio=0 → exp=1 → 必接受；draft 错时 q_lp[wrong] 远
+    # 小于 0 → ratio 远小于 0 → exp≈0 → 必拒绝。这是 DeepInfer 贪心等价
+    # 的数学前提（target/draft 均 argmax），非 one-hot target 不成立。
     greedy = [int(l.argmax().item()) for l in logits]
+    target_lp = torch.stack([_greedy_onehot_lp(g).to(device) for g in greedy[: K + 1]])
+    # 贪心草案：交替对/错（对 = 目标 argmax；错 = argmax+1）
     drafts = [greedy[j] if j % 2 == 0 else (greedy[j] + 1) % V for j in range(K)]
-    draft_lp = torch.stack([_greedy_onehot_lp(d) for d in drafts])
-    u_a = torch.full((K,), 0.5)
+    draft_lp = torch.stack([_greedy_onehot_lp(d) for d in drafts]).to(device)
+    u_a = torch.full((K,), 0.5)  # ratio=1（对）→ 0.5<1 接受；ratio≈0（错）→ 0.5>0 拒绝
     u_s = torch.full((K + 1,), 0.5)
     res = mtp_verify(target_lp, draft_lp, torch.tensor(drafts, device=device), u_a.to(device), u_s.to(device))
     # 非 MTP 贪心：d[0] 对 → 接受；d[1] 错 → 拒绝 → 残差重采样 = 目标 argmax
@@ -66,12 +71,13 @@ def test_greedy_all_accepted_bonus() -> None:
     K = 3
     logits = _make_target(11, K + 1)
     greedy = [int(l.argmax().item()) for l in logits]
-    target_lp = torch.stack([torch.log_softmax(l, dim=-1) for l in logits])
+    # 贪心 target = one-hot（同上：q_lp[argmax]=0 才满足必接受前提）
+    target_lp = torch.stack([_greedy_onehot_lp(g) for g in greedy])
     drafts = greedy[:K]
     draft_lp = torch.stack([_greedy_onehot_lp(d) for d in drafts])
     res = mtp_verify(
         target_lp, draft_lp, torch.tensor(drafts),
-        torch.full((K,), 0.999), torch.full((K + 1,), 0.5),
+        torch.full((K,), 0.5), torch.full((K + 1,), 0.5),  # ratio=1 → 0.5<1 必接受
     )
     # 全接受 + bonus = greedy[K]（K=0 位置 logits 的 argmax）
     assert res.committed == drafts + [greedy[K]]
@@ -88,7 +94,7 @@ def test_k0_degenerates_to_normal_sampling() -> None:
         torch.zeros(0), u,
     )
     cdf = torch.cumsum(lp.exp().double(), dim=-1)
-    expect = int((cdf > 0.37 * float(cdf[0, -1])).argmax().item())
+    expect = int((cdf > 0.37 * float(cdf[0, -1])).long().argmax().item())
     assert res.committed == [expect]
     assert res.bonus_token == expect
 

@@ -46,7 +46,7 @@ class GrammarBackend:
 class XGrammarBackend(GrammarBackend):
     """xgrammar.GrammarMatcher 包装（集群）。掩码行宽 = ceil(vocab/32)。"""
 
-    __slots__ = ("matcher", "vocab_size")
+    __slots__ = ("matcher", "vocab_size", "_buf")
 
     def __init__(self, compiled_grammar, vocab_size: int, tokenizer_info=None) -> None:
         import xgrammar  # 局部导入：仅集群路径
@@ -58,14 +58,18 @@ class XGrammarBackend(GrammarBackend):
         else:
             self.matcher = xgrammar.GrammarMatcher(compiled_grammar)
         self.vocab_size = vocab_size
+        self._buf = None  # 掩码缓冲复用（审查 #22：免每行每步分配）
 
     def fill_mask_into(self, words: Sequence[int], vocab_size: int) -> None:
         import torch
 
+        if self._buf is None or self._buf.shape[1] != len(words):
+            self._buf = torch.zeros(1, len(words), dtype=torch.int32)
+        else:
+            self._buf.zero_()
         # xgrammar 填充 torch int32 [1, words*32 对齐]；落到调用方的行缓冲
-        buf = torch.zeros(1, len(words), dtype=torch.int32)
-        self.matcher.fill_next_token_bitmask(buf, 0)
-        w = buf[0].tolist()
+        self.matcher.fill_next_token_bitmask(self._buf, 0)
+        w = self._buf[0].tolist()
         for i in range(len(words)):
             words[i] = int(w[i])
 

@@ -30,7 +30,8 @@ _SM_B_I64 = _i64(0x94D049BB133111EB)
 _2_POW_NEG_53 = 2.0**-53
 
 _BLOCK_V = 1024
-_BIG = 2147483647  # int32 哨兵（vocab < 2^31）
+# Triton jit 函数内引用全局常量必须是 tl.constexpr 实例（非注解）
+_BIG = 2147483647 if triton is None else tl.constexpr(2147483647)  # int32 哨兵
 
 
 if triton is not None:
@@ -51,6 +52,8 @@ if triton is not None:
         t = tl.program_id(0)
         seed = tl.load(seeds_ptr + t)
         pos = tl.load(positions_ptr + t)
+        # 行基址 int64（审查 #19）：t*vocab 在 int32 下 T*vocab ≥ 2^31 溢出
+        row = t.to(tl.int64) * vocab
         # combined = seed + (seq ^ (seq << 13))，seq = (pos*3 + case) * GOLDEN
         seq = (pos * 3 + CASE) * GOLDEN
         mixed = seq ^ (seq * 8192)  # x<<13 ≡ x*8192 (mod 2^64)
@@ -61,20 +64,21 @@ if triton is not None:
         z = (z ^ ((z >> 27) & 137438953471)) * SM_B  # (1<<37)-1
         z = z ^ ((z >> 31) & 8589934591)  # (1<<33)-1
         u = ((z >> 11) & 9007199254740991).to(tl.float64) * 1.1102230246251565e-16  # (1<<53)-1, 2^-53
-        # 第一遍：行总概率
-        total = 0.0
+        # 第一遍：行总概率（loop-carried 变量必须显式 fp64：0.0 字面量是 fp32，
+        # Triton 禁止循环内类型重赋值）
+        total = tl.zeros([1], dtype=tl.float64)
         for v0 in range(0, vocab, BLOCK_V):
             v = v0 + tl.arange(0, BLOCK_V)
-            p = tl.load(probs_ptr + t * vocab + v, mask=v < vocab, other=0.0).to(tl.float64)
+            p = tl.load(probs_ptr + row + v, mask=v < vocab, other=0.0).to(tl.float64)
             total += tl.sum(p, axis=0)
         target = u * total
         # 第二遍：首个穿越列 + 最后非零列（次正规数边界的回退契约）
-        cdf = 0.0
+        cdf = tl.zeros([1], dtype=tl.float64)
         best = _BIG
         last_nz = 0
         for v0 in range(0, vocab, BLOCK_V):
             v = v0 + tl.arange(0, BLOCK_V)
-            p = tl.load(probs_ptr + t * vocab + v, mask=v < vocab, other=0.0).to(tl.float64)
+            p = tl.load(probs_ptr + row + v, mask=v < vocab, other=0.0).to(tl.float64)
             c = tl.cumsum(p, axis=0) + cdf
             cross = c > target
             cand = tl.where(cross, v, _BIG)

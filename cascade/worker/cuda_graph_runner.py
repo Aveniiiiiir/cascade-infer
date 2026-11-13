@@ -6,11 +6,15 @@
 - 全档位**共享同一 memory pool**（torch.cuda.graph_pool_handle）；
 - 捕获内容 = `model.forward_hidden`（transformer 主体，不含 lm_head——
   每档位 logits [T, vocab] 太大，lm_head 的一次 GEMM 留图外）；
-- 输入缓冲持久化、回放前**原地写入**（input_ids / positions /
-  block_tables 真实行；padding 行恒指向 scratch 块，写入无害）；
+- 回放前**原地写入**（input_ids / positions / block_tables 真实行；
+  padding 行恒指向 scratch 块，写入无害）；
 - 图捕获安全三要素：mla 纯 decode 路径无 .item()（seqlens=positions+1）、
   decode 注意力 num_splits 固定、MoE pad_to 固定（moe_align 尺寸与 grid
-  均由形状决定）。
+  均由形状决定）；外加 **rope 缓冲捕获前预热**（`__init__` 里
+  `_ensure(runtime_max_model_len)`——rope.apply 在捕获路径走
+  ensure=False，无同步且缓冲永不重分配；此前 apply 的
+  `positions.max().item()` 会让每次捕获必抛同步错误，特性从未生效——
+  审查 #5）。
 
 批不变性：padding 行与真实行在 attention/MoE 中按行独立（tl.dot 行间
 无交互；MoE 分桶顺序由 stable-argsort 决定，垃圾 padding token 只改变
@@ -56,6 +60,8 @@ class CudaGraphRunner:
         "max_bt",
         "_tiers",
         "_tier_sizes",
+        "_graph_stream",
+        "_pool",
     )
 
     def __init__(
@@ -74,16 +80,29 @@ class CudaGraphRunner:
         self.cfg = cfg
         self.device = device
         self.max_batch_size = max_batch_size
-        self.num_splits = num_splits if num_splits is not None else envs.CASCADE_CUDAGRAPH_NUM_SPLITS
+        self.num_splits = num_splits if num_splits is not None else envs.CUDAGRAPH_NUM_SPLITS
         self.scratch_block = scratch_block
         self.block_size = cache.cache_cfg.block_size
         # block 表列数：覆盖 runtime_max_model_len + 投机余量
         self.max_bt = cfg.runtime_max_model_len // self.block_size + 2
         self._tiers: dict[int, DecodeGraphTier] = {}
         self._tier_sizes: list[int] = []
-        for size in self._build_tier_sizes(max_batch_size):
+        # 持久 side stream（DeepInfer cuda_graph_runner.py 同构）：warmup 与
+        # 捕获都在同一非默认 stream 上，避免默认 stream 的捕获状态污染
+        self._graph_stream = torch.cuda.Stream()
+        self._pool: tuple[int, int] | None = None
+        # rope 缓冲捕获前固定（审查 #5）：捕获后 _ensure 重分配 = 已捕获的
+        # cos/sin 指针 use-after-free；forward_hidden 恒走 rope_ensure=False
+        rope = getattr(getattr(model, "model", None), "rope", None)
+        if rope is not None and hasattr(rope, "_ensure"):
+            rope._ensure(cfg.runtime_max_model_len)
+        sizes = self._build_tier_sizes(max_batch_size)
+        # 逆序捕获（DeepInfer 同构）：先捕最大档位，memory pool 一次定容；
+        # 小档位复用同一 pool（正向捕获会让 pool 反复扩张，触发
+        # CUDACachingAllocator 的 captures_underway 断言）
+        for size in reversed(sizes):
             self._tiers[size] = self._capture_tier(size)
-            self._tier_sizes.append(size)
+        self._tier_sizes = sizes
         _log.info(
             "CUDA graphs captured: %s (num_splits=%d, scratch_block=%d)",
             self._tier_sizes,
@@ -94,7 +113,7 @@ class CudaGraphRunner:
     # ------------------------------------------------------------------ tiers
 
     def _build_tier_sizes(self, max_batch: int) -> list[int]:
-        interval = envs.CASCADE_CUDAGRAPH_BATCH_SIZE_INTERVAL
+        interval = envs.CUDAGRAPH_BATCH_SIZE_INTERVAL
         sizes = [s for s in (1, 2, 4, 8) if s <= max_batch]
         sizes += list(range(max(16, interval), max_batch + 1, interval))
         if not sizes or sizes[-1] != max_batch:
@@ -129,32 +148,31 @@ class CudaGraphRunner:
             )
 
         # MoE 图模式：本档位的 pad_to（moe_align 固定尺寸；仅捕获期生效）
-        moe_pad_to = self._set_moe_graph_pad_to(T)
+        self._set_moe_graph_pad_to(T)
         try:
-            # warmup（side stream，torch.cuda.graph 要求先跑几遍）
-            s = torch.cuda.Stream()
-            s.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(s):
+            # warmup（持久 side stream；torch.cuda.graph 要求先跑几遍）
+            self._graph_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self._graph_stream):
                 for _ in range(3):
                     callable_()
-            torch.cuda.current_stream().wait_stream(s)
+            torch.cuda.current_stream().wait_stream(self._graph_stream)
             graph = torch.cuda.CUDAGraph()
-            pool = self._graph_pool()
-            with torch.cuda.graph(graph, pool=pool):
+            # 捕获在 side stream + thread_local 错误模式（DeepInfer 同构）；
+            # pool 取首次捕获的 graph.pool()，后续档位共享
+            with torch.cuda.graph(
+                graph, pool=self._pool, stream=self._graph_stream,
+                capture_error_mode="thread_local",
+            ):
                 hidden = callable_()
+            torch.cuda.current_stream().wait_stream(self._graph_stream)
+            if self._pool is None:
+                self._pool = graph.pool()
             return DecodeGraphTier(
                 size=T, graph=graph, input_ids=input_ids, positions=positions,
                 seq_ids=seq_ids, block_tables=block_tables, hidden=hidden,
             )
         finally:
             self._clear_moe_graph_pad_to()
-
-    _pool_handle: object | None = None
-
-    def _graph_pool(self):
-        if CudaGraphRunner._pool_handle is None:
-            CudaGraphRunner._pool_handle = torch.cuda.graph_pool_handle()
-        return CudaGraphRunner._pool_handle
 
     def _set_moe_graph_pad_to(self, T: int) -> int:
         from cascade.model_executor.layers.moe import DeepseekMoE

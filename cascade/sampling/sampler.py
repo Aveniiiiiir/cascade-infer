@@ -91,7 +91,10 @@ class Sampler:
         ks = rows.top_ks
         if bool((ks > 0).any()):
             sorted_x = x.sort(dim=-1, descending=True).values
-            k_idx = torch.clamp(ks, min=1).to(torch.int64) - 1
+            # 审查 #9：k ≥ vocab 等价不截断（kth=行最小值 ⇒ 无列被掩掉），
+            # 但 gather 索引必须落在 [0, vocab-1]——否则越界崩溃
+            ks_eff = torch.where((ks > 0) & (ks < vocab), ks, torch.full_like(ks, vocab))
+            k_idx = torch.clamp(ks_eff, min=1).to(torch.int64) - 1
             kth = sorted_x.gather(1, k_idx[:, None]).squeeze(1)  # 每行第 k 大
             kth = torch.where((ks > 0) & (ks < vocab), kth, torch.full_like(kth, float("-inf")))
             x = x.masked_fill(x < kth[:, None], float("-inf"))

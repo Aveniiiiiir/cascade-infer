@@ -3,10 +3,19 @@
 用法（集群）:
     python -m cascade.entrypoints.http.server --model /path/to/DeepSeek-V2-Lite --port 8000
 
-架构：AsyncEngine = 请求队列 + 后台引擎线程（ZOS 三段式 step 循环）+
+架构：AsyncEngine = 请求队列 + 后台引擎线程（同步序 step 循环）+
 轮询式流式缓冲（v1：10ms 轮询桥接线程→asyncio；call_soon_threadsafe
 桥接后置）。端点：/v1/chat/completions（流/非流）、/v1/completions、
 /v1/models。
+
+审查 #4/#6/#14/#18 修复要点：
+- 引擎线程对 add_request / step 的异常**永不死亡**：单请求畸形只判死该
+  请求（error 回执），引擎步异常则 fail_all_inflight 后继续；
+- _buffers/_finished 在消费方结束（含断连/超时）时清理，杜绝无界增长；
+- prompt 空串 / 超长在 handler 层 400 拒绝（不进引擎线程）；
+- stop 字符串 tokenize 为 token 序列交给调度器后缀截断；
+- 可选 --api-key（Bearer）；默认仍监听 0.0.0.0（集群内网部署假设，
+  对外暴露请务必配 api-key 或网络隔离）。
 """
 
 from __future__ import annotations
@@ -22,6 +31,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
+from cascade.common.logger import get_logger
 from cascade.entrypoints.http.protocol import (
     ChatCompletionChunk,
     ChatCompletionChunkChoice,
@@ -36,7 +46,17 @@ from cascade.entrypoints.http.protocol import (
 from cascade.entrypoints.llm import LLM
 from cascade.sampling_params import SamplingParams
 
+_log = get_logger("http.serving")
+
 _POLL_INTERVAL = 0.01  # 流式轮询（v1 桥接）
+_REQUEST_TIMEOUT_S = 600.0  # 单请求 wall-clock 上限（防引擎挂死拖死连接）
+
+
+def _bad_request(msg: str) -> JSONResponse:
+    return JSONResponse(
+        {"error": {"message": msg, "type": "invalid_request_error"}},
+        status_code=400,
+    )
 
 
 class AsyncEngine:
@@ -57,13 +77,20 @@ class AsyncEngine:
 
     def _engine_loop(self) -> None:
         while not self._stop.is_set():
-            # 1. 收编新请求
+            # 1. 收编新请求（审查 #4：add_request 异常只判死该请求，不杀线程）
             drained = False
             try:
                 while True:
                     rid, ids, sp = self._queue.get_nowait()
-                    self._engine.add_request(rid, ids, sp)
                     drained = True
+                    try:
+                        # LLMEngine.add_request 签名：(prompt_token_ids,
+                        # sampling_params, request_id)——位置序勿与 (rid, ids, sp) 混淆
+                        self._engine.add_request(ids, sp, rid)
+                    except Exception as e:
+                        _log.warning("add_request rejected %s: %s", rid, e)
+                        with self._lock:
+                            self._finished[rid] = "error"
             except queue.Empty:
                 pass
             # 2. 引擎步进（有活才跑）
@@ -74,22 +101,23 @@ class AsyncEngine:
                 continue
             try:
                 outputs = self._engine.step()
-            except Exception as e:  # 引擎异常不杀线程（请求级隔离原则外层兜底）
-                import logging
-
-                logging.getLogger("cascade.http").exception("engine step failed: %s", e)
-                outputs = []
+            except Exception:
+                # 审查 #4：异常步之后 pending 永不提交 → schedule 的深度断言
+                # 会把循环锁进 100% CPU 忙转。fail_all_inflight 判死全部在途
+                # 请求并复位 pending，引擎继续服务新请求。
+                _log.exception("engine step failed; failing all in-flight requests")
+                outputs = self._engine.scheduler.fail_all_inflight()
             for ro in outputs:
-                with self._lock:
-                    self._buffers.setdefault(ro.request_id, []).append(ro)
-                    if ro.finish_reason is not None:
-                        self._finished[ro.request_id] = ro.finish_reason
-        # 收尾冲刷
-        for ro in self._engine._post_process_prev():
-            with self._lock:
-                self._buffers.setdefault(ro.request_id, []).append(ro)
-                if ro.finish_reason is not None:
-                    self._finished[ro.request_id] = ro.finish_reason
+                self._put(ro)
+        # 收尾冲刷（判死回执；同步序下无在途采样滞后）
+        for ro in self._engine.scheduler.flush_final_outputs():
+            self._put(ro)
+
+    def _put(self, ro) -> None:
+        with self._lock:
+            self._buffers.setdefault(ro.request_id, []).append(ro)
+            if ro.finish_reason is not None:
+                self._finished[ro.request_id] = ro.finish_reason
 
     # ------------------------------------------------------------------ public
 
@@ -100,23 +128,38 @@ class AsyncEngine:
         self._queue.put((rid, prompt_ids, params))
         return rid
 
-    def abort(self, rid: str) -> None:
-        self._engine.abort(rid)
+    def abort(self, rid: str) -> bool:
+        return self._engine.abort(rid)
 
-    def iter_outputs(self, rid: str) -> AsyncGenerator:
-        """轮询式流式产出（v1 线程→asyncio 桥接）。"""
+    def iter_outputs(self, rid: str, timeout_s: float = _REQUEST_TIMEOUT_S) -> AsyncGenerator:
+        """轮询式流式产出（v1 线程→asyncio 桥接）。
+
+        审查 #6：生成器退出（finish/断连/超时）时清理 _buffers/_finished 的
+        rid 键——否则键随请求数无界累积；超时触发 abort 让引擎停止为该
+        请求继续算 KV。
+        """
 
         async def gen() -> AsyncGenerator:
-            while True:
+            deadline = time.monotonic() + timeout_s
+            try:
+                while True:
+                    with self._lock:
+                        chunk = self._buffers.get(rid, [])
+                        self._buffers[rid] = []
+                        finish = self._finished.get(rid)
+                    for ro in chunk:
+                        yield ro
+                    if finish is not None:
+                        return
+                    if time.monotonic() > deadline:
+                        _log.warning("request %s timed out after %.0fs; aborting", rid, timeout_s)
+                        self.abort(rid)
+                        return
+                    await _sleep_async(_POLL_INTERVAL)
+            finally:
                 with self._lock:
-                    chunk = self._buffers.get(rid, [])
-                    self._buffers[rid] = []
-                    finish = self._finished.get(rid)
-                for ro in chunk:
-                    yield ro
-                if finish is not None:
-                    return
-                await _sleep_async(_POLL_INTERVAL)
+                    self._buffers.pop(rid, None)
+                    self._finished.pop(rid, None)
 
         return gen()
 
@@ -160,10 +203,47 @@ def _chat_prompt_ids(llm: LLM, messages: list[ChatMessage]) -> list[int]:
     return tok.encode(text)
 
 
-def create_app(llm: LLM) -> FastAPI:
+def _stop_token_seqs(llm: LLM, stop: list[str] | None) -> list[tuple[int, ...]] | None:
+    """stop 字符串 → token 序列（调度器后缀截断）。空串/编码失败 → None
+    表示应拒绝请求（返回哨兵由调用方 400）。"""
+    if not stop:
+        return []
+    seqs: list[tuple[int, ...]] = []
+    for s in stop:
+        if not isinstance(s, str) or not s:
+            return None
+        enc = llm.tokenizer.encode(s)
+        if not enc:
+            return None
+        seqs.append(tuple(enc))
+    return seqs
+
+
+def _validate_prompt(llm: LLM, ids: list[int]) -> JSONResponse | None:
+    """审查 #4：空/超长 prompt 在 handler 层拒绝，不进引擎线程。"""
+    if not ids:
+        return _bad_request("prompt tokenize 后为空（messages 内容为空）")
+    max_len = llm._engine.cfg.model.max_model_len
+    if len(ids) > max_len:
+        return _bad_request(f"prompt {len(ids)} tokens 超过 max_model_len={max_len}")
+    return None
+
+
+def create_app(llm: LLM, api_key: str | None = None) -> FastAPI:
     app = FastAPI(title="Cascade OpenAI-compatible server")
     engine = AsyncEngine(llm)
     model_name = getattr(llm, "_model_dir", "cascade") or "cascade"
+
+    if api_key:
+        @app.middleware("http")
+        async def _check_api_key(request, call_next):
+            auth = request.headers.get("Authorization", "")
+            if not auth.startswith("Bearer ") or auth[len("Bearer "):] != api_key:
+                return JSONResponse(
+                    {"error": {"message": "invalid api key", "type": "auth_error"}},
+                    status_code=401,
+                )
+            return await call_next(request)
 
     @app.get("/v1/models")
     def list_models() -> dict:
@@ -172,14 +252,23 @@ def create_app(llm: LLM) -> FastAPI:
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatCompletionRequest):
         ids = _chat_prompt_ids(llm, req.messages)
-        sp = SamplingParams(
-            temperature=req.temperature,
-            top_p=req.top_p,
-            max_tokens=req.max_tokens or 256,
-            seq_seed=req.seed if req.seed is not None else 0,
-            stop_token_ids=(llm.eos_token_id,),
-            so_args=_so_args_from_request(req),
-        )
+        if (err := _validate_prompt(llm, ids)) is not None:
+            return err
+        stop_seqs = _stop_token_seqs(llm, req.stop)
+        if stop_seqs is None:
+            return _bad_request("stop 序列含空串或无法 tokenize")
+        try:
+            sp = SamplingParams(
+                temperature=req.temperature,
+                top_p=req.top_p,
+                max_tokens=req.max_tokens or 256,
+                seq_seed=req.seed if req.seed is not None else 0,
+                stop_token_ids=(llm.eos_token_id,),
+                stop_token_seqs=stop_seqs,
+                so_args=_so_args_from_request(req),
+            )
+        except ValueError as e:
+            return _bad_request(str(e))
         rid = engine.submit(ids, sp)
         created = int(time.time())
         if req.stream:
@@ -191,18 +280,25 @@ def create_app(llm: LLM) -> FastAPI:
             tokens.extend(ro.new_token_ids)
             if ro.finish_reason is not None:
                 finish = ro.finish_reason
+        if finish == "error":
+            return JSONResponse(
+                {"error": {"message": "request rejected by engine", "type": "engine_error"}},
+                status_code=500,
+            )
         text = llm.tokenizer.decode(tokens)
         return ChatCompletionResponse(
             id=rid,
             created=created,
             model=req.model or model_name,
             choices=[ChatCompletionChoice(message=ChatMessage(role="assistant", content=text), finish_reason=finish)],
-            usage=UsageInfo(prompt_tokens=len(ids), completion_tokens=len(tokens)),
+            usage=UsageInfo(
+                prompt_tokens=len(ids),
+                completion_tokens=len(tokens),
+                total_tokens=len(ids) + len(tokens),
+            ),
         )
 
     async def _stream_chat(engine: AsyncEngine, llm: LLM, rid: str, model: str, created: int):
-        import json
-
         first = True
         acc_tokens: list[int] = []
         acc_text = ""
@@ -239,15 +335,20 @@ def create_app(llm: LLM) -> FastAPI:
     async def completions(req: CompletionRequest):
         prompts = req.prompt if isinstance(req.prompt, list) else [req.prompt]
         if len(prompts) != 1:
-            return JSONResponse({"error": "仅支持单 prompt"}, status_code=400)
+            return _bad_request("仅支持单 prompt")
         ids = llm.tokenizer.encode(prompts[0])
-        sp = SamplingParams(
-            temperature=req.temperature,
-            top_p=req.top_p,
-            max_tokens=req.max_tokens or 256,
-            seq_seed=req.seed if req.seed is not None else 0,
-            stop_token_ids=(llm.eos_token_id,),
-        )
+        if (err := _validate_prompt(llm, ids)) is not None:
+            return err
+        try:
+            sp = SamplingParams(
+                temperature=req.temperature,
+                top_p=req.top_p,
+                max_tokens=req.max_tokens or 256,
+                seq_seed=req.seed if req.seed is not None else 0,
+                stop_token_ids=(llm.eos_token_id,),
+            )
+        except ValueError as e:
+            return _bad_request(str(e))
         rid = engine.submit(ids, sp)
         tokens: list[int] = []
         finish = "stop"
@@ -255,6 +356,11 @@ def create_app(llm: LLM) -> FastAPI:
             tokens.extend(ro.new_token_ids)
             if ro.finish_reason is not None:
                 finish = ro.finish_reason
+        if finish == "error":
+            return JSONResponse(
+                {"error": {"message": "request rejected by engine", "type": "engine_error"}},
+                status_code=500,
+            )
         return {
             "id": rid,
             "object": "text_completion",
@@ -263,6 +369,11 @@ def create_app(llm: LLM) -> FastAPI:
             "choices": [
                 {"index": 0, "text": llm.tokenizer.decode(tokens), "finish_reason": finish}
             ],
+            "usage": {
+                "prompt_tokens": len(ids),
+                "completion_tokens": len(tokens),
+                "total_tokens": len(ids) + len(tokens),
+            },
         }
 
     return app
@@ -275,6 +386,11 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--max-model-len", type=int, default=None)
     parser.add_argument("--max-num-seqs", type=int, default=64)
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="可选 Bearer token；对外暴露时务必设置（默认 0.0.0.0 假设内网部署）",
+    )
     args = parser.parse_args()
     import uvicorn
 
@@ -283,7 +399,7 @@ def main() -> None:
         max_model_len=args.max_model_len,
         max_num_seqs=args.max_num_seqs,
     )
-    app = create_app(llm)
+    app = create_app(llm, api_key=args.api_key)
     uvicorn.run(app, host=args.host, port=args.port)
 
 

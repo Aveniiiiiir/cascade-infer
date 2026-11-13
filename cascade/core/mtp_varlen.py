@@ -88,6 +88,8 @@ class MtpVarlen:
         """性能曲线线性插值（曲线外延用端点斜率）。"""
         curve = self.perf_curve
         assert curve
+        if len(curve) == 1:  # 审查 #16：单点曲线无斜率可外延
+            return curve[0][1]
         xs = [c[0] for c in curve]
         if total_q <= xs[0]:
             return curve[0][1]

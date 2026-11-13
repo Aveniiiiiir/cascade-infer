@@ -35,7 +35,14 @@ class LLM:
         model_cfg = ModelConfig.from_hf_dict(hf)
         if max_model_len is not None:
             model_cfg.max_model_len = max_model_len
-        self.eos_token_id = int(hf.get("eos_token_id", 100001))
+        # eos 回退链（审查 #13）：config.json → generation_config.json →
+        # DeepSeek V2 家族默认 3。旧默认 100001 在 config 缺键时永不命中
+        # EOS，全部生成拖到 length cap。
+        gen: dict = {}
+        gen_path = Path(model_dir) / "generation_config.json"
+        if gen_path.exists():
+            gen = json.loads(gen_path.read_text(encoding="utf-8"))
+        self.eos_token_id = int(hf.get("eos_token_id", gen.get("eos_token_id", 3)))
         cfg = EngineConfig(
             model=model_cfg,
             cache=CacheConfig(),
@@ -53,6 +60,9 @@ class LLM:
         if self._tokenizer is None:
             from transformers import AutoTokenizer
 
+            # 安全注记（审查 #18）：trust_remote_code 会执行模型目录内的
+            # 自定义 Python——仅当 model_dir 可信时使用（本机路径/官方仓库）。
+            # 不可信来源的模型必须先审计其 tokenizer 代码。
             self._tokenizer = AutoTokenizer.from_pretrained(self._model_dir, trust_remote_code=True)
         return self._tokenizer
 

@@ -1,8 +1,9 @@
-"""Model runner: SchedulerOutput → GPU forward → sampled tokens (sync Phase 2)。
+"""Model runner: SchedulerOutput → GPU forward → sampled tokens。
 
-三段式（forward → post_process(prev) → sample）的 ZOS 版本在 Phase 4 重构；
-本文件先把闭环打通：prepare_batch 张量构建（对应 DeepInfer
-`csrc/engine/input_metadata/prepare_tensor_input_v4.cpp` 的 Python 参考版）。
+同步序引擎（LLMEngine.step）：schedule → prepare_batch → forward →
+launch_sample → wait → commit（ZOS 一步滞后的 GPU 侧喂数属后续 Phase，
+见 llm_engine.py 的路线说明）。prepare_batch 的张量构建对应 DeepInfer
+`csrc/engine/input_metadata/prepare_tensor_input_v4.cpp` 的 Python 参考版。
 """
 
 from __future__ import annotations
@@ -52,12 +53,13 @@ class DraftInfo:
 
 @dataclass(slots=True)
 class SampleLaunch:
-    """一步采样的在途状态（ZOS：launch → 异步 D2H → 下一步 post_process 提交）。"""
+    """一步采样的在途状态（launch → 异步 D2H → wait_tokens 提交；同步序
+    下同一步内消费，D2H 事件仍是本步唯一的 CPU-GPU 同步点）。"""
 
     request_ids: list[str]
     pinned: torch.Tensor  # [R] int32 CPU（pinned；CUDA 事件守卫）
     event: object | None  # torch.cuda.Event（无 CUDA 时 None）
-    sched_out: "SchedulerOutput"  # 提交时需要（持有以简化引擎侧簿记）
+    sched_out: "SchedulerOutput"  # 持有以简化引擎侧簿记（调试/未来 ZOS）
     #: MTP 验证行的结果（同步验证模式：sample 阶段已得到 CPU 列表；
     #: 多 token/seq）
     tokens_dict: dict[str, list[int]] | None = None
@@ -76,7 +78,14 @@ class SampleLaunch:
 
 
 class ModelRunner:
-    __slots__ = ("engine_cfg", "model", "cfg", "cache", "device", "dtype", "use_absorbed", "sampler")
+    # 审查 #1：__slots__ 必须覆盖 __init__ 赋值的全部属性（slots 类无
+    # __dict__，漏声明 = 构造即 AttributeError）。曾有 draft/_mtp_drafts/
+    # calibrator/_so_* 漏写导致引擎从未成功构造。
+    __slots__ = (
+        "engine_cfg", "model", "cfg", "cache", "device", "dtype", "use_absorbed",
+        "sampler", "draft_model", "calibrator",
+        "_mtp_drafts", "_so_matchers", "_so_failed",
+    )
 
     def __init__(
         self,
@@ -114,14 +123,26 @@ class ModelRunner:
         _log.info("ModelRunner ready: %d KV blocks (bs=%d)", num_blocks, engine_cfg.cache.block_size)
 
     def _profile_num_blocks(self, cache_cfg: CacheConfig) -> int:
-        """显存预算推 block 数。真实 profile run（峰值测量）Phase 2 集群验收时替换。"""
+        """显存预算推 block 数。真实 profile run（峰值测量）Phase 2 集群验收时替换。
+
+        cap 到「max_num_seqs × runtime_max_model_len / block_size」的最大实际
+        需求——tiny 模型的 per_block 极小，按显存比例推导会得出数百万块
+        （20GB+ 无意义分配），远超任何调度场景的上限。
+        """
         if self.device.startswith("cuda"):
             free, _total = torch.cuda.mem_get_info()
             budget = int(free * cache_cfg.gpu_memory_utilization)
         else:
             budget = 256 * 2**20  # CPU 测试默认 256 MiB
         n = derive_num_blocks(budget, self.cfg, cache_cfg.block_size)
-        _log.info("KV budget %.2f GiB → %d blocks", budget / 2**30, n)
+        # 实际需求上界：所有并发 seq 的 KV 足迹（含投机余量）
+        max_useful = (
+            self.engine_cfg.scheduler.max_num_seqs
+            * self.engine_cfg.runtime_max_model_len
+            + cache_cfg.block_size - 1
+        ) // cache_cfg.block_size + 1
+        n = min(n, max_useful)
+        _log.info("KV budget %.2f GiB → %d blocks (cap %d)", budget / 2**30, n, max_useful)
         return n
 
     # ------------------------------------------------------------------ batch prep
@@ -185,7 +206,9 @@ class ModelRunner:
 
     # ------------------------------------------------------------------ forward + sample
 
-    def forward(self, batch: ForwardBatch) -> torch.Tensor:
+    def forward(self, batch: ForwardBatch, rope_ensure: bool = True) -> torch.Tensor:
+        """rope_ensure=False：引擎已预热 rope 缓冲（LLMEngine.__init__ 调
+        _ensure(runtime_max_model_len)）→ 每层免 .item() 同步（审查 #20）。"""
         return self.model(
             batch.input_ids,
             batch.positions,
@@ -194,6 +217,7 @@ class ModelRunner:
             batch.block_tables,
             self.cache,
             use_absorbed=self.use_absorbed,
+            rope_ensure=rope_ensure,
         )
 
     # ------------------------------------------------------------------ SO
@@ -283,7 +307,7 @@ class ModelRunner:
         sched_out: SchedulerOutput,
         batch: ForwardBatch,
     ) -> SampleLaunch | None:
-        """三段式第 3 段：启动确定性采样 + 异步 D2H（不碰 CPU 结果）。
+        """采样段：确定性采样 + 异步 D2H（引擎同步序下同一步内 wait 提交）。
 
         token 的绝对位置 = seq.num_tokens（update 追加前），
         golden 索引 = seq.num_output_tokens（追加前）。
@@ -317,7 +341,10 @@ class ModelRunner:
         K = self.engine_cfg.scheduler.nextn_draft_tokens
         for (rid, scalars, pos, golden), row_idx, s in zip(sel, rows_idx, sel_sched):
             if (not s.is_prefill) and K > 0:
-                committed = self._verify_mtp_seq(logits, s, scalars.seq_seed)
+                # 段首的【批内】偏移 = 段末行偏移 + 1 - 段长（审查 #3：此前用
+                # 绝对 token 位置切片 logits，批内多行时读错行/越界）
+                seg_off = row_idx + 1 - s.num_new_tokens
+                committed = self._verify_mtp_seq(logits, s, scalars.seq_seed, seg_off)
                 mtp_tokens[rid] = committed
             else:
                 plain_sel.append((rid, scalars, pos, golden))
@@ -361,8 +388,12 @@ class ModelRunner:
 
     # ------------------------------------------------------------------ MTP
 
-    def _verify_mtp_seq(self, logits: torch.Tensor, s, seq_seed: int) -> list[int]:
+    def _verify_mtp_seq(self, logits: torch.Tensor, s, seq_seed: int, seg_off: int) -> list[int]:
         """单 seq 的 MTP 验证：logits 段 [1+K, V] + 上轮草案 → 提交 token。
+
+        `seg_off` = 该段在**展平批内**的起始偏移（由 launch_sample 传入；
+        graph 路径 = decode_batch_meta 的 segment_offsets）。绝对位置 P 由
+        seq 状态推导（随机流用），两者职责不同，不可混用（审查 #3 修复）。
 
         SO 集成（DeepInfer matcher.py:366-376 语义）：行 j 的掩码 = 试探性
         接受 d_0..d_{j-1} 后的状态；bonus 行 = 全接受态；填完回滚全部试探
@@ -375,8 +406,7 @@ class ModelRunner:
         from cascade.model_executor.triton_ops.common import CASE_SAMPLE, CASE_VERIFY
 
         seq = s.seq
-        off = seq.num_tokens_computed - s.num_new_tokens  # 段首（本 runner 批内偏移）
-        rows = logits[off : off + s.num_new_tokens].to(torch.float32)
+        rows = logits[seg_off : seg_off + s.num_new_tokens].to(torch.float32)
         K_actual = s.num_new_tokens - 1
         draft = self._mtp_drafts.pop(seq.request_id, None)
         P = seq.num_tokens - 1  # 输入首行（已提交末 token）的绝对位置
@@ -407,7 +437,28 @@ class ModelRunner:
             except Exception:
                 self._so_failed.add(seq.request_id)
                 matcher.status = -1
-        lp = torch.log_softmax(rows, dim=-1)
+        # 与普通采样一致的变换（温度/top-k/top-p）——此前直接 log_softmax
+        # 原始 logits，贪心时（eps 温度）普通采样是 one-hot argmax，MTP 的
+        # 逆 CDF 在非 one-hot 分布上不等价（MTP ≡ 非 MTP 贪心因此失败）。
+        # 用 Sampler._transform 的同一套变换后再取 log。
+        from cascade.sampling.sampler import SamplingRows
+
+        n_rows = rows.shape[0]
+        scalars = seq.sampling
+        temps = torch.full((n_rows,), scalars.temperature, dtype=torch.float32, device=dev)
+        top_ps = torch.full((n_rows,), scalars.top_p, dtype=torch.float32, device=dev)
+        top_ks = torch.full((n_rows,), scalars.top_k, dtype=torch.int32, device=dev)
+        sr = SamplingRows(
+            temperatures=temps, top_ps=top_ps, top_ks=top_ks,
+            seq_seeds=torch.zeros(n_rows, dtype=torch.int64, device=dev),
+            positions=torch.zeros(n_rows, dtype=torch.int64, device=dev),
+            goldens=torch.full((n_rows,), -1, dtype=torch.int32, device=dev),
+            request_ids=[seq.request_id] * n_rows,
+        )
+        probs = self.sampler._transform(rows.clone(), sr)  # [n_rows, V] 概率
+        # log(0) = -inf（合法：exp(-inf)=0，零概率列永不命中——与普通采样
+        # 的逆 CDF 契约一致；clamp 会把零概率列变成非零，破坏该契约）
+        lp = probs.log()
         accept_u = torch.tensor(
             [derive_uniform(seq_seed, P + j + 1, CASE_VERIFY) for j in range(K_actual)],
             dtype=torch.float32,

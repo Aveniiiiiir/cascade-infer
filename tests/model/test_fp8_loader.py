@@ -66,8 +66,11 @@ def test_load_fp8_checkpoint(tmp_path: Path) -> None:
         "num_experts_per_tok": 2,
         "rms_norm_eps": 1e-5,
     }
-    w = torch.randn(H, H).to(torch.float8_e4m3fn)
-    scale = torch.full((H // 128, H // 128), 0.5, dtype=torch.float32)
+    # q_a_proj: [q_lora_rank=32, hidden_size=128]（输出维是 rank 不是 H）
+    q_lora = int(cfg["q_lora_rank"])
+    w = torch.randn(q_lora, H).to(torch.float8_e4m3fn)
+    # 128 blockwise 尺度：[ceil(rank/128), ceil(H/128)] = [1, 1]
+    scale = torch.full(((q_lora + 127) // 128, (H + 127) // 128), 0.5, dtype=torch.float32)
     (tmp_path / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
     from safetensors.torch import save_file
 

@@ -22,9 +22,10 @@ Semantics mirror DeepInfer's `csrc/engine/scheduler.hpp` where applicable:
   fresh (vLLM V1 / DeepInfer fork clamp `set_num_tokens(min(..., len-1))`):
   a fully-cached sequence would otherwise produce a 0-token prefill row.
 - **Optimistic advancement**: `num_tokens_computed` is advanced at *schedule*
-  time, before the step executes — the same one-step-lag protocol DeepInfer's
-  ZOS builds on, here in its trivially-consistent synchronous form. Phase 4
-  (ZOS) keeps this protocol and only shifts *when* update_from_output runs.
+  time, before the step executes, and rolled back at commit for rejected
+  MTP drafts (`_commit_optimistic_advance`)。DeepInfer 的 ZOS 在此协议上
+  把 update 滞后一步；Cascade 引擎当前为同步序（LLMEngine.step 的
+  docstring 记录了原因），pending 深度恒 ≤ 1，断言仍然成立。
 
 Divergence from DeepInfer (documented): we mix decode tokens and prefill
 chunks in a single varlen batch (vLLM V1 style) instead of alternating
@@ -291,7 +292,7 @@ class Scheduler:
     # ------------------------------------------------------------------ commit
 
     def update_from_output(self, sampled: dict[str, list[int]]) -> list[RequestOutput]:
-        """提交**最旧**未提交调度输出的采样结果（ZOS：滞后一步调用）。
+        """提交**最旧**未提交调度输出的采样结果。
 
         窗口内被 abort/判死的 seq 直接跳过（DeepInfer process_outputs :906
         对 finished 跳过，不靠 assert）——其块已在 _finish_sequence 释放。
@@ -300,10 +301,9 @@ class Scheduler:
 
         Args:
             sampled: request_id → 新采样 token 列表。prefill 中间 chunk 无条目；
-                末 chunk 与 decode 各产出 1 个 token（Phase 5 MTP 起可为多个）。
+                末 chunk 与 decode 各产出 1 个 token（MTP 行可为多个）。
         """
-        outputs = list(self._pending_req_outputs)
-        self._pending_req_outputs.clear()
+        outputs = self.flush_final_outputs()
         if not self._pending_outputs:
             return outputs
         last = self._pending_outputs.popleft()
@@ -319,9 +319,13 @@ class Scheduler:
                 f"{seq.request_id}: 采样 token 数 {len(new_tokens)} 超出调度行 "
                 f"{scheduled.num_new_tokens}（MTP 提交契约）"
             )
-            # ---- 截断：max_tokens / max_model_len / 首个 stop token ----
+            # ---- 截断：max_tokens / max_model_len / 首个 stop token / stop 序列 ----
             final, finish_status = self._truncate_new_tokens(seq, new_tokens)
-            seq.append_output_tokens(final)
+            # stop 序列的截断点可落在本步 token 之前（序列前段在先前步已
+            # 流式发出）⇒ final 可为空：合法提交（零新 token + finish 回执），
+            # 不触发 append 的非空断言
+            if final:
+                seq.append_output_tokens(final)
 
             # ---- 乐观回滚（仅 decode/MTP 行）：prefill 行的 num_new 全部真实
             # （chunk 的 KV 全部提交），不做回滚；decode 行的差额 = 被拒 draft，
@@ -525,9 +529,18 @@ class Scheduler:
     def _truncate_new_tokens(
         self, seq: Sequence, new_tokens: list[int]
     ) -> tuple[list[int], SequenceStatus | None]:
-        """多 token 提交的截断：输出上限 / 位置上限 / 首个 stop token。
+        """多 token 提交的截断：输出上限 / 位置上限 / 首个 stop token / stop 序列。
 
         Returns: (最终提交的 token 列表, finish_status 或 None)。
+
+        多 token stop 序列语义（审查 #14）：
+        - 在「已提交输出 ‖ 本步新 token」上扫描**最早完成点**（MTP 多 token
+          提交时序列可落在本步 token 中间，非仅尾部）；
+        - 命中时截断到序列首（输出不含 stop 文本）并判 FINISHED_STOPPED；
+        - 单 token stop（含 EOS）由 is_stop_token 在逐 token 循环中精确命中；
+          跨步序列在**完成点**检测——若序列的前几个 token 在先前步已流式
+          发出，则该部分无法回收（文本级 holdback 属 tokenizer 集成层，
+          后置）。当前契约：跨步序列只保证「到此为止」，不保证已发前缀干净。
         """
         # 上限：max_tokens 剩余额度 + 位置余量
         allowed = min(
@@ -554,6 +567,26 @@ class Scheduler:
             finish = SequenceStatus.FINISHED_LENGTH_CAPPED
         if finish is None and seq.num_tokens + len(out) >= self.cfg.model.max_model_len:
             finish = SequenceStatus.FINISHED_LENGTH_CAPPED
+        # ---- 多 token stop 序列：完成点检测（MTP 多 token 提交时序列可落在
+        # 本步 token 中间，纯尾部匹配会漏——扫描本步内最早的完成位置）----
+        if seq.sampling.stop_token_seqs:
+            full = seq.output_token_ids + out
+            committed = len(seq.output_token_ids)
+            cut: int | None = None
+            for sseq in seq.sampling.stop_token_seqs:
+                n = len(sseq)
+                if n == 0 or n > len(full):
+                    continue
+                # 完成位置 e 必须 > committed（序列由本步 token 完成；完全落在
+                # 已提交前缀内的出现在先前步已处理）
+                for e in range(max(committed + 1, n), len(full) + 1):
+                    if tuple(full[e - n : e]) == tuple(sseq):
+                        s = e - n
+                        cut = s if cut is None else min(cut, s)
+                        break
+            if cut is not None:
+                keep = max(cut - committed, 0)
+                return out[:keep], SequenceStatus.FINISHED_STOPPED
         return out, finish
 
     def _commit_optimistic_advance(self, seq: Sequence, scheduled_new: int, committed: int) -> None:
@@ -575,6 +608,36 @@ class Scheduler:
         self._finish_sequence(seq, SequenceStatus.FINISHED_SO_FAILED)
         return True
 
+    def flush_final_outputs(self) -> list[RequestOutput]:
+        """冲刷判死请求的最终输出缓冲（abort/STOP 抢占/ignored/SO 失败）。
+
+        update_from_output 每次调用会顺带冲刷；引擎在空调度步 / 收尾时
+        显式调用，保证 finish 回执不滞留（审查 #2 配套）。"""
+        outputs = list(self._pending_req_outputs)
+        self._pending_req_outputs.clear()
+        return outputs
+
+    def fail_all_inflight(self) -> list[RequestOutput]:
+        """引擎步异常后的兜底（审查 #4）：判死全部在途请求（含已调度未提交
+        的行）、清空 pending 队列。请求级隔离原则的最后一道防线——异常步
+        之后 pending 永不提交会让 schedule() 的深度断言把引擎锁进忙转。
+
+        Returns: 全部判死请求的最终 RequestOutput（供 serving 层回执）。
+        """
+        victims: list[Sequence] = []
+        for out in self._pending_outputs:
+            victims.extend(s.seq for s in out.scheduled if not s.seq.is_finished)
+        self._pending_outputs.clear()
+        victims.extend(self.running)
+        victims.extend(self.waiting)
+        seen: set[int] = set()
+        for seq in victims:
+            if id(seq) in seen or seq.is_finished:
+                continue
+            seen.add(id(seq))
+            self._finish_sequence(seq, SequenceStatus.FINISHED_ABORTED)
+        return self.flush_final_outputs()
+
     def update_mtp_accept(self, request_id: str, accept_probs: list[float]) -> None:
         """引擎在验证后回灌接受概率 → 累乘率（varlen 调度输入）。
 
@@ -584,17 +647,6 @@ class Scheduler:
         if self._mtp_varlen is None:
             return
         self._mtp_rates[request_id] = MtpVarlen.cumprod(accept_probs)
-
-    def _check_stop(self, seq: Sequence, token: int) -> SequenceStatus | None:
-        if seq.sampling.is_stop_token(token):
-            return SequenceStatus.FINISHED_STOPPED
-        if seq.num_output_tokens >= seq.sampling.max_tokens:
-            return SequenceStatus.FINISHED_LENGTH_CAPPED
-        # 下一个 token 的绝对位置 = num_tokens，必须 < max_model_len
-        # （runtime_max_model_len 的投机余量只作用于 KV/位置分配，不放宽输出上限）
-        if seq.num_tokens + 1 > self.cfg.model.max_model_len:
-            return SequenceStatus.FINISHED_LENGTH_CAPPED
-        return None
 
     # ------------------------------------------------------------------ misc
 

@@ -148,8 +148,13 @@ def test_so_bitmask_constraint(device: str) -> None:
     g = torch.Generator().manual_seed(6)
     words = torch.randint(0, 2**31, (R, num_words), generator=g, dtype=torch.int64).to(torch.int32).to(device)
     # 每行至少 8 个合法位：直接点亮 token 0..7 对应的位
+    idx = torch.arange(vocab, device=device)
+    w_idx = idx // 32  # token → word 下标
+    b_idx = idx % 32   # token → 位下标
     for i in range(R):
-        allowed = ((words[i].long() >> (torch.arange(vocab, device=device) % 32)) & 1).bool()
+        # 先按 word 索引展开到 [vocab]，再移位取位（此前直接对 [num_words]
+        # 右移 [vocab] 的位下标，维度不匹配）
+        allowed = ((words[i].long()[w_idx] >> b_idx) & 1).bool()
         if int(allowed.sum()) < 8:
             for j in range(8):
                 words[i, j // 32] |= 1 << (j % 32)
@@ -199,7 +204,7 @@ def test_sampling_distribution_goodness_of_fit(device: str) -> None:
     ]
     rows = build_sampling_rows(per_row, device)
     got = Sampler().sample(logits.clone(), rows)
-    counts = torch.bincount(torch.tensor(got, dtype=torch.long), minlength=vocab).float()
+    counts = torch.bincount(torch.tensor(got, dtype=torch.long), minlength=vocab).float().to(device)
     # 期望分布 = naive 变换后的 probs（独立 oracle）
     probs = torch.softmax(logits_row / 1.0, dim=-1)
     exp_probs = _naive_transform_row(logits_row, 1.0, -1, 0.95)

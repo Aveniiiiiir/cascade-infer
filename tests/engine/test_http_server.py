@@ -25,6 +25,11 @@ class _StubTokenizer:
     def decode(self, ids: list[int]) -> str:
         return "".join(chr(i) for i in ids)
 
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+        # 仅拼接 content（不加 role 前缀）——否则 prompt_tokens 与断言不符；
+        # 真实 tokenizer 的模板由 transformers 提供
+        return "".join(m["content"] for m in messages)
+
 
 class _FakeLLM:
     """server 只用 duck typing（tokenizer/_engine/eos_token_id）。"""

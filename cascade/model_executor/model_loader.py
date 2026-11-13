@@ -66,7 +66,7 @@ def load_deepseek_v2(
         state.update(safetensors.torch.load_file(str(f)))
     if fp8_mode:
         state = _dequant_fp8_state(state)
-    report = _assign(model, state, dtype)
+    report = _assign(model, state, dtype, tie_word_embeddings=cfg.tie_word_embeddings)
     if cfg.tie_word_embeddings:
         model.tie_weights()
     model.to(device=device, dtype=dtype, non_blocking=True)
@@ -112,18 +112,34 @@ def _dequant_fp8_state(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor
 
 
 def _dequant_blockwise(w: torch.Tensor, scale: torch.Tensor, block: int = 128) -> torch.Tensor:
-    """[N, H] fp8 × [N/128, H/128] 尺度 → bf16。"""
+    """[N, H] fp8 × [ceil(N/128), ceil(H/128)] 尺度 → bf16。
+
+    尺度经 repeat_interleave 扩展到 block 网格后**裁剪**到 [N, H]——
+    兼容非 128 对齐的权重（如 rank=32 的 q_a_proj），不再硬断言对齐。
+    """
     N, H = w.shape
-    assert N % block == 0 and H % block == 0, f"非 128 对齐 fp8 权重 {tuple(w.shape)}"
     s = scale.to(torch.float32)
-    s = s.repeat_interleave(block, dim=0).repeat_interleave(block, dim=1)  # [N, H]
+    s = s.repeat_interleave(block, dim=0).repeat_interleave(block, dim=1)  # [ceil*Nblk, ceil*Hblk]
+    s = s[:N, :H]  # 裁剪到实际权重形状（非 128 对齐时去尾）
     return (w.to(torch.float32) * s).to(torch.bfloat16)
 
 
-def _assign(model: torch.nn.Module, state: dict[str, torch.Tensor], dtype: torch.dtype) -> LoadReport:
+def _assign(
+    model: torch.nn.Module,
+    state: dict[str, torch.Tensor],
+    dtype: torch.dtype,
+    tie_word_embeddings: bool = False,
+) -> LoadReport:
+    """审查 #12：missing 报告保真——
+    - lm_head.weight 仅在 tie_word_embeddings 时从 missing 排除（此前无条件
+      排除：非 tie checkpoint 缺 lm_head → 随机初始化 → 静默垃圾输出）；
+    - 专家堆叠参数按 (name, expert_idx) 粒度记录（此前任一专家键加载就把
+      整个 w1/w3/w2 标记 covered：部分专家缺失被掩盖 → 零权重专家）。
+    """
     report = LoadReport()
     own = model.state_dict()
-    covered: set[str] = set()  # 已赋值的模型参数名（堆叠参数按名标记）
+    covered: set[str] = set()  # 已赋值的普通参数名
+    expert_seen: dict[str, set[int]] = {}  # 堆叠参数名 → 已加载的专家切片
     for key, tensor in state.items():
         report.num_tensors += 1
         report.num_bytes += tensor.numel() * tensor.element_size()
@@ -140,7 +156,7 @@ def _assign(model: torch.nn.Module, state: dict[str, torch.Tensor], dtype: torch
                 report.unexpected.append(key)
                 continue
             target[expert_idx].copy_(tensor.to(dtype))
-            covered.add(target_name)
+            expert_seen.setdefault(target_name, set()).add(expert_idx)
             continue
         if key not in own:
             report.unexpected.append(key)
@@ -152,7 +168,16 @@ def _assign(model: torch.nn.Module, state: dict[str, torch.Tensor], dtype: torch
         else:
             target.copy_(tensor.to(dtype))
         covered.add(key)
-    report.missing = [k for k in own if k not in covered and "lm_head.weight" not in k]
+    report.missing = [
+        k
+        for k in own
+        if k not in covered
+        and k not in expert_seen
+        and not (tie_word_embeddings and k == "lm_head.weight")
+    ]
+    for name, seen in expert_seen.items():
+        num_experts = own[name].shape[0]
+        report.missing.extend(f"{name}[{e}]" for e in range(num_experts) if e not in seen)
     return report
 
 

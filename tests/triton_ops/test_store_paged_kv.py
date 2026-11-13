@@ -28,7 +28,19 @@ def _make_case(device: str, dtype: torch.dtype, seed: int = 0):
     for i in range(n_seqs):
         block_tables[i, :4] = torch.arange(i * 4 + 1, i * 4 + 5, device=device)
     seq_ids = torch.randint(0, n_seqs, (T,), generator=g, dtype=torch.int64).to(device)
+    # 去重 (seq,pos)：同一槽位多次写入时高级索引 scatter 的覆盖顺序未定义，
+    # 与 naive 顺序写无法逐位对拍——本用例只验证单射写入的正确性
     positions = torch.randint(0, 32, (T,), generator=g, dtype=torch.int64).to(device)
+    seen: set[tuple[int, int]] = set()
+    keep: list[int] = []
+    for t in range(T):
+        key = (int(seq_ids[t]), int(positions[t]))
+        if key not in seen:
+            seen.add(key)
+            keep.append(t)
+    seq_ids = seq_ids[keep]
+    positions = positions[keep]
+    latent = latent[keep]
     return kv, latent, seq_ids, positions, block_tables
 
 

@@ -47,6 +47,11 @@ def _prompts() -> list[list[int]]:
 def test_so_constrains_greedy_output(device: str) -> None:
     """stub 文法 "30,11,42"：贪心输出前三 token 必须逐位吻合；terminated
     后全开（后续为模型 argmax），max_tokens 收尾。"""
+    from cascade.structured_output.compiler import has_xgrammar
+
+    if has_xgrammar():
+        pytest.skip("本测试依赖 StubGrammar 的逐步约束语义（无 xgrammar 环境）；"
+                    "xgrammar 会把 '30,11,42' 当 regex 编译，语义不同")
     eng = _make_engine(device)
     schema = "30,11,42"
     prompts = _prompts()
@@ -64,6 +69,10 @@ def test_so_constrains_greedy_output(device: str) -> None:
 @pytest.mark.parametrize("device", _devices())
 def test_so_with_mtp(device: str) -> None:
     """MTP + SO：提交的 token 序列仍满足约束（试探掩码 + 回滚正确）。"""
+    from cascade.structured_output.compiler import has_xgrammar
+
+    if has_xgrammar():
+        pytest.skip("依赖 StubGrammar 语义（无 xgrammar 环境）")
     eng = _make_engine(device, with_mtp=True)
     schema = "7,19"
     prompts = _prompts()[:1]
@@ -99,8 +108,9 @@ def test_so_failure_isolation(device: str) -> None:
             results[ro.request_id].extend(ro.new_token_ids)
             if ro.finish_reason is not None:
                 finish[ro.request_id] = ro.finish_reason
-    # 冲刷
-    for ro in eng._post_process_prev():
+    # 冲刷（同步序下判死回执经 flush_final_outputs；staged 编译失败的
+    # FINISHED_SO_FAILED 输出在 step() 顶部冲刷）
+    for ro in eng.scheduler.flush_final_outputs():
         results[ro.request_id].extend(ro.new_token_ids)
         if ro.finish_reason is not None:
             finish[ro.request_id] = ro.finish_reason

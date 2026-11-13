@@ -52,19 +52,25 @@ def _make_setup(max_batch: int = 16, seed: int = 0):
     )
     engine_cfg.validate()
     model = DeepseekV2ForCausalLM(cfg, device=dev).to(dev, torch.bfloat16)
-    cache = CacheEngine(cfg, engine_cfg.cache, num_blocks=64, device=dev, dtype=torch.bfloat16)
+    # 256 块：每 decode 行独占 7 块（见 _decode_case），12 行需 84 块
+    cache = CacheEngine(cfg, engine_cfg.cache, num_blocks=256, device=dev, dtype=torch.bfloat16)
     runner = CudaGraphRunner(model, cache, engine_cfg, dev, max_batch, scratch_block=1)
     return model, cache, runner, engine_cfg
 
 
 def _decode_case(n: int, seed: int = 1):
-    """构造 n 个 decode 行的输入与 block 表（每 seq 独立块段）。"""
+    """构造 n 个 decode 行的输入与 block 表（每 seq 独立块段）。
+
+    位置必须落在 block 表覆盖范围内（pos < 7*bs=56）：块表短于 seqlen 时
+    越界列落到保留块 0，多行写同一槽位产生竞态（此前 eager vs graph
+    的 81% 不匹配即此——测试构造缺陷，非 kernel 缺陷）。
+    """
     g = torch.Generator().manual_seed(seed)
     tokens = torch.randint(1, 500, (n,), generator=g).tolist()
-    positions = list(range(100, 100 + n * 7, 7))  # 互不相同的绝对位置
+    positions = [(i * 7) % 44 + 1 for i in range(n)]  # 1..44 < 7*8
     block_rows = []
     for i in range(n):
-        row = [i * 8 + 2 + j for j in range(6)]  # 每 seq 独占 6 块
+        row = [i * 7 + 2 + j for j in range(7)]  # 每 seq 独占 7 块（覆盖 56 token）
         block_rows.append(row)
     return tokens, positions, block_rows
 

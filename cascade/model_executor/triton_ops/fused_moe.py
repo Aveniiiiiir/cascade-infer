@@ -46,11 +46,17 @@ if triton is not None:
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
         offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        tokens = tl.load(sorted_token_ids_ptr + offs_m)  # [BM] flat 槽位
+        tokens = tl.load(sorted_token_ids_ptr + offs_m)  # [BM] 槽位
         valid = tokens >= 0
+        # -1 填充槽位的地址 clamp：tokens=-1 时 tokens*(2N)/N/H 为负地址，
+        # mask 不阻止地址计算——统一用 0 代替（store 由 valid 阻止）
+        tokens = tl.where(valid, tokens, 0)
         token_rows = tl.where(valid, tokens // K, 0)
         expert = tl.load(expert_ids_ptr + pid_m)
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        # N 维 clamp（同 decode attn 的 h_valid）：mask 不阻止地址计算越界，
+        # offs_n ≥ N 时地址超出权重分配——用 safe 下标（store 由 mask 阻止）
+        offs_n = tl.where(offs_n < N, offs_n, N - 1)
         offs_k = tl.arange(0, BLOCK_K)
         acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         for k0 in range(0, H, BLOCK_K):
@@ -94,8 +100,10 @@ if triton is not None:
         offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         tokens = tl.load(sorted_token_ids_ptr + offs_m)
         valid = tokens >= 0
+        tokens = tl.where(valid, tokens, 0)  # -1 槽位地址 clamp（同 gemm1）
         expert = tl.load(expert_ids_ptr + pid_m)
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # H 空间
+        offs_n = tl.where(offs_n < H, offs_n, H - 1)  # 地址 clamp（同 gemm1）
         offs_k = tl.arange(0, BLOCK_K)
         acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         for k0 in range(0, N, BLOCK_K):
@@ -152,7 +160,9 @@ def fused_experts(
     num_blocks = expert_ids.numel()  # 形状决定（图模式下固定）
     inter1 = torch.empty(T * K, 2 * N, dtype=x.dtype, device=device)
     inter2 = torch.empty(T * K, N, dtype=x.dtype, device=device)
-    c2 = torch.empty(T * K, H, dtype=x.dtype, device=device)
+    # c2 必须零初始化：gemm2 只写 valid 槽位（sorted_ids>=0），invalid 槽位
+    # 的垃圾值会被末尾 sum(dim=1) 加进输出（bf16 下产生 2% 元素偏差）
+    c2 = torch.zeros(T * K, H, dtype=x.dtype, device=device)
     sorted_ids = sorted_ids.to(torch.int32)
     expert_ids_c = expert_ids.to(torch.int32)
     weights_flat = topk_weight.reshape(-1).to(torch.float32).contiguous()
@@ -183,7 +193,13 @@ def fused_experts_ref(
     topk_weight: torch.Tensor,
     topk_ids: torch.Tensor,
 ) -> torch.Tensor:
-    """参考实现（逐专家循环；堆叠权重）。"""
+    """参考实现（逐专家循环；堆叠权重）。
+
+    同 token 同 expert 多 slot（topk_ids 允许重复专家）时，每个 slot 独立
+    加权累加——不能用 weights[token_rows]=...（后者覆盖前者）。改为按
+    (token, slot) 逐条 index_add 的等价向量形式：expert_out 按 token 展开
+    到全部 slot 后加权。
+    """
     T, H = x.shape
     E, N, _ = w1.shape
     K = topk_ids.shape[1]
@@ -192,16 +208,14 @@ def fused_experts_ref(
         token_rows, k_slots = torch.nonzero(topk_ids == e, as_tuple=True)
         if token_rows.numel() == 0:
             continue
-        rows = torch.unique(token_rows)
+        # 每个 (token, slot) 独立算一次（同 token 同 expert 多 slot 不合并）
+        rows = token_rows
         h1 = x[rows] @ w1[e].T
         h3 = x[rows] @ w3[e].T
         act = F.silu(h1) * h3
-        expert_out = act @ w2[e].T  # [R, H]
-        weights = torch.zeros(T, device=x.device, dtype=torch.float32)
-        weights[token_rows] = topk_weight[token_rows, k_slots]
-        out.index_add_(
-            0, rows, (expert_out * weights[rows].to(x.dtype).unsqueeze(-1)).to(x.dtype)
-        )
+        expert_out = act @ w2[e].T  # [num_slots, H]
+        w = topk_weight[token_rows, k_slots].to(x.dtype).unsqueeze(-1)  # [num_slots, 1]
+        out.index_add_(0, rows, (expert_out * w).to(x.dtype))
     return out
 
 

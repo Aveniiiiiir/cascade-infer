@@ -79,6 +79,15 @@ def test_from_hf_dict_rejects_unknown_type() -> None:
                                   "qk_rope_head_dim": 2, "qk_nope_head_dim": 2, "v_head_dim": 2})
 
 
+def test_from_hf_dict_rejects_v3_explicitly() -> None:
+    """审查 #8：V3 的 n_group 组路由 / rope beta / nextn 权重未实现——
+    显式拒绝，绝不静默半支持（错误路由 = 静默错误输出）。"""
+    d = dict(V2_LITE_CONFIG)
+    d["model_type"] = "deepseek_v3"
+    with pytest.raises(NotImplementedError, match="deepseek_v3"):
+        ModelConfig.from_hf_dict(d)
+
+
 def test_mla_kv_heads_must_be_1() -> None:
     d = dict(V2_LITE_CONFIG)
     d["num_key_value_heads"] = 8

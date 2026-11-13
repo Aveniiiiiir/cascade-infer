@@ -42,6 +42,7 @@ if triton is not None:
         BS: tl.constexpr,
         KV_LORA: tl.constexpr,
         ROPE: tl.constexpr,
+        ROPE_PAD: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
     ):
@@ -57,30 +58,34 @@ if triton is not None:
         offs_m = tl.arange(0, BLOCK_M)
         m_valid = offs_m < q_len
         offs_d = tl.arange(0, KV_LORA)
-        offs_r = tl.arange(0, ROPE)
+        # ROPE pad（tl.dot 的 K 维下限 16）：ROPE_PAD = max(16, next_pow2(ROPE))，
+        # 生产模型 ROPE=64 时取 64（不截断），tiny 模型 ROPE=8 时 pad 到 16
+        offs_r = tl.arange(0, ROPE_PAD)
+        rope_valid = offs_r < ROPE
         q_row = qbase + offs_m
         q_base_p = q_ptr + q_row[:, None].to(tl.int64) * (H * D) + h * D
         q_abs = tl.load(q_base_p + offs_d[None, :], mask=m_valid[:, None], other=0.0)
-        q_rope = tl.load(q_base_p + KV_LORA + offs_r[None, :], mask=m_valid[:, None], other=0.0)
+        q_rope = tl.load(q_base_p + KV_LORA + offs_r[None, :], mask=m_valid[:, None] & rope_valid[None, :], other=0.0)
         m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
         l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
         acc = tl.zeros([BLOCK_M, KV_LORA], dtype=tl.float32)
         pos_q = q_pos0 + offs_m  # [BLOCK_M] 绝对位置
+        # 块 id 逐 token 查表（同 decode kernel）：BLOCK_N 可跨物理块
         for t0 in range(0, kv_end, BLOCK_N):
-            block_idx = t0 // BS
-            block_id = tl.load(block_tables_ptr + seg * MAX_BLOCKS + block_idx).to(tl.int64)
-            base = block_id * BS * D
-            offs_n = (t0 % BS) + tl.arange(0, BLOCK_N)
             tok = t0 + tl.arange(0, BLOCK_N)
             valid = tok < kv_end
+            blk = tl.load(
+                block_tables_ptr + seg * MAX_BLOCKS + tok // BS, mask=valid, other=0
+            ).to(tl.int64)
+            row_base = blk * BS * D + (tok % BS) * D
             c = tl.load(
-                kv_ptr + base + offs_n[:, None] * D + offs_d[None, :],
+                kv_ptr + row_base[:, None] + offs_d[None, :],
                 mask=valid[:, None],
                 other=0.0,
             )
             rope = tl.load(
-                kv_ptr + base + offs_n[:, None] * D + KV_LORA + offs_r[None, :],
-                mask=valid[:, None],
+                kv_ptr + row_base[:, None] + KV_LORA + offs_r[None, :],
+                mask=valid[:, None] & rope_valid[None, :],
                 other=0.0,
             )
             s = tl.dot(q_abs, tl.trans(c)) + tl.dot(q_rope, tl.trans(rope))  # [M, N]
@@ -114,7 +119,10 @@ def paged_mla_prefill_attn(
     T, H, D = q.shape
     BS = kv.shape[1]
     assert kv.shape[2] == D and D - kv_lora > 0
-    assert BS % block_n == 0
+    # BLOCK_N 下限 16（tl.dot 的 N 维约束）；块 id 逐 token 查表后不再要求
+    # BLOCK_N 整除 KV block size
+    block_n = max(16, block_n)
+    rope_pad = max(16, triton.next_power_of_2(D - kv_lora))
     assert q.dtype == kv.dtype and q.is_contiguous() and kv.is_contiguous()
     # kernel 路径要求 tensor-core dtype；fp32（紧容差测试场景）走 ref
     if not (use_triton(q.device) and q.dtype in (torch.bfloat16, torch.float16)):
@@ -152,6 +160,7 @@ def paged_mla_prefill_attn(
         BS=BS,
         KV_LORA=kv_lora,
         ROPE=D - kv_lora,
+        ROPE_PAD=rope_pad,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         num_warps=8,

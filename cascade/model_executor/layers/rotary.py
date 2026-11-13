@@ -38,18 +38,40 @@ class RotaryEmbedding:
         self._ensure(max_pos)
         return self._cos[:max_pos], self._sin[:max_pos]
 
-    def apply(self, q: torch.Tensor, k: torch.Tensor, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def apply(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        positions: torch.Tensor,
+        ensure: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """q/k: [..., head_dim]（最后一维 rope）。positions: 同 broadcast 到 [...,] 的绝对位置。
 
         NeoX rotate_half: x' = x*cos + rotate_half(x)*sin，
         rotate_half(x) = concat(-x[..., d/2:], x[..., :d/2])。
+
+        ensure=True（默认，测试/直调安全）：按需扩容缓冲（含一次
+        positions.max().item() 的 CPU-GPU 同步）。
+        ensure=False（引擎热路径/图捕获）：**跳过检查与同步**——调用方必须
+        保证容量已由 `_ensure(runtime_max_model_len)` 预热（审查 #5/#20：
+        捕获区间内的 .item() 同步会让 CUDA graph 捕获必败；捕获后 _ensure
+        重分配还会造成已捕获指针的 use-after-free）。
         """
-        max_pos = int(positions.max().item()) + 1 if positions.numel() else 1
-        cos, sin = self.cos_sin(max_pos)
-        cos_p = cos[positions]  # [..., dim]
-        sin_p = sin[positions]
-        q2 = q * cos_p + _rotate_half(q) * sin_p
-        k2 = k * cos_p + _rotate_half(k) * sin_p
+        if ensure and positions.numel():
+            max_pos = int(positions.max().item()) + 1
+            self._ensure(max_pos)
+        # cos/sin 索引后为 [T, dim]。q 为 [T, heads, dim]（多头）时需
+        # unsqueeze(1) 广播到头维；k 可能是 [T, dim]（MQA 单流）或
+        # [T, heads, dim]，按各自 ndim 处理（此前 q/k 共用同一 cos_p，
+        # k 为 2D 时与 unsqueeze 后的 3D cos_p 维度不匹配）。
+        cos_p = self._cos[positions]
+        sin_p = self._sin[positions]
+        cos_q = cos_p.unsqueeze(1) if q.ndim == 3 else cos_p
+        sin_q = sin_p.unsqueeze(1) if q.ndim == 3 else sin_p
+        cos_k = cos_p.unsqueeze(1) if k.ndim == 3 else cos_p
+        sin_k = sin_p.unsqueeze(1) if k.ndim == 3 else sin_p
+        q2 = q * cos_q + _rotate_half(q) * sin_q
+        k2 = k * cos_k + _rotate_half(k) * sin_k
         return q2.to(q.dtype), k2.to(k.dtype)
 
 

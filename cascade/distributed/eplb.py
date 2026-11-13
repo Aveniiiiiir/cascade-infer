@@ -90,9 +90,11 @@ def eplb_load_balance_ratio(counts: list[int], num_experts: int, ep_size: int) -
     """moe_lb 指标 = max_rank / mean（DeepInfer MOE_LB_STAT_INTERVAL 语义）。"""
     assert len(counts) == num_experts
     per_rank = [0] * ep_size
-    cap = num_experts // ep_size
+    # 审查 #17：num_experts 不整除 ep_size 时 e//cap 可能越界——clamp 到
+    # 最后一个 rank（指标语义下近似连续分桶）
+    cap = max(1, (num_experts + ep_size - 1) // ep_size)
     for e, c in enumerate(counts):
-        per_rank[e // cap] += c
+        per_rank[min(e // cap, ep_size - 1)] += c
     total = sum(per_rank)
     if total == 0:
         return 1.0

@@ -107,11 +107,12 @@ class MLAAttention(nn.Module):
         rope: RotaryEmbedding,
         use_absorbed: bool = False,
         num_splits: int | None = None,  # 图捕获时固定（避免 .item() 同步）
+        rope_ensure: bool = True,  # False = 调用方已预热 rope 缓冲（免同步热路径）
     ) -> torch.Tensor:
         # 1. 投影 + rope
         q_nope, q_rope = self.project_q(x)
         c, k_rope = self.project_kv(x)
-        q_rope, k_rope = rope.apply(q_rope, k_rope, positions)
+        q_rope, k_rope = rope.apply(q_rope, k_rope, positions, ensure=rope_ensure)
         # 2. 写 paged KV：[c ‖ k_rope(已 rope)]（triton/ref 自动分发）
         latent = torch.cat((c, k_rope), dim=-1)  # [T, 576]
         cache.store_latent(self.layer_idx, latent, seq_ids, positions, block_tables)
@@ -255,7 +256,10 @@ class MLAAttention(nn.Module):
         k_full = torch.cat((k_nope, k_rope_kv.unsqueeze(1).expand(P, self.num_heads, self.qk_rope)), dim=-1)
         # fp32 分数 + 位置 causal 掩码
         scores = torch.einsum("lhd,phd->hlp", q_full.float(), k_full.float()) * self.scale
-        mask = positions.unsqueeze(0) >= torch.arange(P, device=positions.device).unsqueeze(1)  # [L,P]
+        # mask[q_pos, k_pos] = positions[q] >= k：unsqueeze(1) 使 positions 成为
+        # 列向量 [L,1]，与 arange(P) 行向量 [1,P] 广播为 [L,P]（此前
+        # unsqueeze(0) 得到的是转置的 [P,L]，L==P 时掩码方向错误）
+        mask = positions.unsqueeze(1) >= torch.arange(P, device=positions.device).unsqueeze(0)  # [L,P]
         scores = scores.masked_fill(~mask.unsqueeze(0), float("-inf"))
         w = torch.softmax(scores, dim=-1)
         out = torch.einsum("hlp,phd->lhd", w, v.float()).to(v.dtype)  # [L, h, 128]
@@ -276,7 +280,8 @@ class MLAAttention(nn.Module):
         q_abs = torch.einsum("lhd,hdk->lhk", q_nope.float(), self.u_k.float())
         q_full = torch.cat((q_abs, q_rope.float()), dim=-1)  # [L, h, 576]
         scores = torch.einsum("lhk,pk->hlp", q_full, kv.float()) * self.scale
-        mask = positions.unsqueeze(0) >= torch.arange(P, device=positions.device).unsqueeze(1)
+        # 同上：mask[q, k] = positions[q] >= k，unsqueeze(1) 得 [L,P]（非转置）
+        mask = positions.unsqueeze(1) >= torch.arange(P, device=positions.device).unsqueeze(0)
         scores = scores.masked_fill(~mask.unsqueeze(0), float("-inf"))
         w = torch.softmax(scores, dim=-1)
         # 加权累积 latent（各头独立权重），再 W_UV 上投影

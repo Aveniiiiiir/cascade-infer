@@ -37,11 +37,12 @@ if triton is not None:
         partial_lse_ptr,  # [N, SPLITS, H] fp32
         H,
         MAX_BLOCKS,
-        BLOCKS_PER_SPLIT,
+        NUM_SPLITS,
         SCALE,
         BS: tl.constexpr,
         KV_LORA: tl.constexpr,
         ROPE: tl.constexpr,
+        ROPE_PAD: tl.constexpr,
         BLOCK_H: tl.constexpr,
         BLOCK_N: tl.constexpr,
     ):
@@ -50,46 +51,63 @@ if triton is not None:
         hb = tl.program_id(2)
         D: tl.constexpr = KV_LORA + ROPE
         seqlen = tl.load(seqlens_ptr + n)
-        start = sp * BLOCKS_PER_SPLIT * BS
+        # 分片边界全在设备侧计算（审查补充：此前 wrapper 用
+        # seqlens.max().item() 求 blocks_per_split——捕获区间内的 CPU-GPU
+        # 同步会让 CUDA graph 捕获失败，与 rope .item() 同类缺陷）
+        blocks_needed = tl.cdiv(seqlen, BS)
+        blocks_per_split = tl.cdiv(blocks_needed, NUM_SPLITS)
+        start = sp * blocks_per_split * BS
         offs_h = hb * BLOCK_H + tl.arange(0, BLOCK_H)
         offs_d = tl.arange(0, KV_LORA)
-        offs_r = tl.arange(0, ROPE)
+        # 头维 mask + 地址 clamp：BLOCK_H=16 > H（tiny 模型 4 头）时 offs_h
+        # 越界。mask 只控制是否读写，不阻止地址计算越界——用 safe 下标
+        # （越界行映射到 H-1，store 由 mask 阻止）保证地址恒在分配内。
+        h_valid = offs_h < H
+        offs_h = tl.where(h_valid, offs_h, H - 1)
+        # ROPE pad（tl.dot 的 K 维最小 16 约束）：ROPE_PAD = max(16, next_pow2(ROPE))；
+        # 生产模型 ROPE=64 时 ROPE_PAD=64（不截断），tiny 模型 ROPE=8 时 pad 到 16
+        offs_r = tl.arange(0, ROPE_PAD)
+        rope_valid = offs_r < ROPE
         if start >= seqlen:
             # 空分片：lse = -inf（reduce 时权重为 0），v = 0
             lse = tl.full([BLOCK_H], float("-inf"), dtype=tl.float32)
-            tl.store(partial_lse_ptr + (n * tl.num_programs(1) + sp) * H + offs_h, lse)
+            tl.store(partial_lse_ptr + (n * tl.num_programs(1) + sp) * H + offs_h, lse, mask=h_valid)
             v = tl.zeros([BLOCK_H, KV_LORA], dtype=tl.float32)
             tl.store(
                 partial_v_ptr + ((n * tl.num_programs(1) + sp) * H + offs_h[:, None]) * KV_LORA + offs_d[None, :],
                 v,
+                mask=h_valid[:, None],
             )
             return
-        end = tl.minimum(start + BLOCKS_PER_SPLIT * BS, seqlen)
+        end = tl.minimum(start + blocks_per_split * BS, seqlen)
         # q tiles（每程序一次加载）
         q_base = q_ptr + n * H * D + offs_h[:, None] * D
-        q_abs = tl.load(q_base + offs_d[None, :])  # [BLOCK_H, KV_LORA] bf16
-        q_rope = tl.load(q_base + KV_LORA + offs_r[None, :])  # [BLOCK_H, ROPE]
+        q_abs = tl.load(q_base + offs_d[None, :], mask=h_valid[:, None], other=0.0)  # [BLOCK_H, KV_LORA] bf16
+        q_rope = tl.load(q_base + KV_LORA + offs_r[None, :], mask=h_valid[:, None] & rope_valid[None, :], other=0.0)  # [BLOCK_H, 16]
         m_i = tl.full([BLOCK_H], float("-inf"), dtype=tl.float32)
         l_i = tl.zeros([BLOCK_H], dtype=tl.float32)
         acc = tl.zeros([BLOCK_H, KV_LORA], dtype=tl.float32)
-        # KV 分片内按 BLOCK_N 展平迭代（BLOCK_N 整除 BS ⇒ 每 chunk 恰在一个块内）
+        # KV 分片内按 BLOCK_N 展平迭代。块 id **逐 token 查表**（不再假设
+        # BLOCK_N 整除 BS）：小 KV block（tiny 模型 bs=8）+ BLOCK_N≥16
+        # （tl.dot 的 N 维下限）时一个 chunk 可跨多个物理块。
         for t0 in range(start, end, BLOCK_N):
-            block_idx = t0 // BS
-            block_id = tl.load(block_tables_ptr + n * MAX_BLOCKS + block_idx)
-            base = block_id * BS * D
-            offs_n = (t0 % BS) + tl.arange(0, BLOCK_N)
             tok = t0 + tl.arange(0, BLOCK_N)
             valid = tok < end
+            # int64（审查 #7）：blk*BS*D 在 int32 下 ~58k 块即溢出越界读
+            blk = tl.load(
+                block_tables_ptr + n * MAX_BLOCKS + tok // BS, mask=valid, other=0
+            ).to(tl.int64)
+            row_base = blk * BS * D + (tok % BS) * D  # [BLOCK_N] 每 token 行基址
             c = tl.load(
-                kv_ptr + base + offs_n[:, None] * D + offs_d[None, :],
+                kv_ptr + row_base[:, None] + offs_d[None, :],
                 mask=valid[:, None],
                 other=0.0,
             )  # [BLOCK_N, KV_LORA] bf16
             rope = tl.load(
-                kv_ptr + base + offs_n[:, None] * D + KV_LORA + offs_r[None, :],
-                mask=valid[:, None],
+                kv_ptr + row_base[:, None] + KV_LORA + offs_r[None, :],
+                mask=valid[:, None] & rope_valid[None, :],
                 other=0.0,
-            )  # [BLOCK_N, ROPE]
+            )  # [BLOCK_N, ROPE_PAD]
             s = tl.dot(q_abs, tl.trans(c)) + tl.dot(q_rope, tl.trans(rope))  # [H, N] fp32
             s = s * SCALE
             s = tl.where(valid[None, :], s, float("-inf"))
@@ -102,9 +120,10 @@ if triton is not None:
         v = acc / l_i[:, None]
         lse = m_i + tl.log(l_i)
         split_idx = n * tl.num_programs(1) + sp
-        tl.store(partial_lse_ptr + split_idx * H + offs_h, lse)
+        tl.store(partial_lse_ptr + split_idx * H + offs_h, lse, mask=h_valid)
         tl.store(
-            partial_v_ptr + (split_idx * H + offs_h[:, None]) * KV_LORA + offs_d[None, :], v
+            partial_v_ptr + (split_idx * H + offs_h[:, None]) * KV_LORA + offs_d[None, :], v,
+            mask=h_valid[:, None],
         )
 
     @triton.jit
@@ -121,21 +140,25 @@ if triton is not None:
         hb = tl.program_id(1)
         offs_h = hb * BLOCK_H + tl.arange(0, BLOCK_H)
         offs_d = tl.arange(0, KV_LORA)
+        h_valid = offs_h < H  # 同 partial：BLOCK_H > H 时 mask 越界头
+        offs_h = tl.where(h_valid, offs_h, H - 1)  # 地址 clamp（同 partial）
         m = tl.full([BLOCK_H], float("-inf"), dtype=tl.float32)
         for sp in range(SPLITS):
-            m = tl.maximum(m, tl.load(partial_lse_ptr + (n * SPLITS + sp) * H + offs_h))
+            m = tl.maximum(m, tl.load(partial_lse_ptr + (n * SPLITS + sp) * H + offs_h, mask=h_valid, other=float("-inf")))
         w_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
         out = tl.zeros([BLOCK_H, KV_LORA], dtype=tl.float32)
         for sp in range(SPLITS):
-            lse = tl.load(partial_lse_ptr + (n * SPLITS + sp) * H + offs_h)
+            lse = tl.load(partial_lse_ptr + (n * SPLITS + sp) * H + offs_h, mask=h_valid, other=float("-inf"))
             w = tl.exp(lse - m)
             v = tl.load(
-                partial_v_ptr + ((n * SPLITS + sp) * H + offs_h[:, None]) * KV_LORA + offs_d[None, :]
+                partial_v_ptr + ((n * SPLITS + sp) * H + offs_h[:, None]) * KV_LORA + offs_d[None, :],
+                mask=h_valid[:, None],
+                other=0.0,
             )
             out += w[:, None] * v
             w_sum += w
         out = out / w_sum[:, None]
-        tl.store(out_ptr + (n * H + offs_h[:, None]) * KV_LORA + offs_d[None, :], out)
+        tl.store(out_ptr + (n * H + offs_h[:, None]) * KV_LORA + offs_d[None, :], out, mask=h_valid[:, None])
 
 
 def paged_mla_decode_attn(
@@ -155,16 +178,24 @@ def paged_mla_decode_attn(
     BS = kv.shape[1]
     assert kv.shape[2] == D
     assert D - kv_lora > 0 and D - kv_lora <= 64
-    assert BS % block_n == 0, f"block_n={block_n} 必须整除 kv block size {BS}"
+    # BLOCK_N 下限 16（tl.dot 的 N 维约束）；块 id 逐 token 查表后不再要求
+    # BLOCK_N 整除 KV block size
+    block_n = max(16, block_n)
     assert q.dtype == kv.dtype and q.is_contiguous() and kv.is_contiguous()
-    # kernel 路径要求 tensor-core dtype；fp32（紧容差测试场景）走 ref
+    # kernel 路径要求 tensor-core dtype；fp32（紧容差测试场景）走 ref。
+    # ROPE<16 不再回退 ref（ref 有 .item()，图捕获不安全）——kernel 用
+    # ROPE_PAD 把 rope 维 pad 到 ≥16，tiny 模型（ROPE=8）也走 kernel。
     if not (use_triton(q.device) and q.dtype in (torch.bfloat16, torch.float16)):
         return paged_mla_decode_attn_ref(q, kv, block_tables, seqlens, scale, kv_lora)
-    max_seqlen = int(seqlens.max().item())
-    blocks_needed = (max_seqlen + BS - 1) // BS
+    rope = D - kv_lora
+    rope_pad = max(16, triton.next_power_of_2(rope))
+    # num_splits=None 仅出现在 eager 路径（可安全同步）；图捕获路径由
+    # CudaGraphRunner 固定 num_splits，此处**不做 .item()**（审查补充：
+    # wrapper 的 seqlens.max().item() 是捕获区间内的非法同步）
     if num_splits is None:
+        max_seqlen = int(seqlens.max().item())
+        blocks_needed = (max_seqlen + BS - 1) // BS
         num_splits = max(1, min(_MAX_SPLITS, blocks_needed // 4))
-    blocks_per_split = (blocks_needed + num_splits - 1) // num_splits
     bt = block_tables.to(torch.int32)
     partial_v = torch.empty(N, num_splits, H, kv_lora, dtype=torch.float32, device=q.device)
     partial_lse = torch.empty(N, num_splits, H, dtype=torch.float32, device=q.device)
@@ -172,8 +203,8 @@ def paged_mla_decode_attn(
     grid = (N, num_splits, (H + block_h - 1) // block_h)
     _decode_partial_kernel[grid](
         q, kv, bt, seqlens, partial_v, partial_lse,
-        H, bt.shape[1], blocks_per_split, scale,
-        BS=BS, KV_LORA=kv_lora, ROPE=D - kv_lora,
+        H, bt.shape[1], num_splits, scale,
+        BS=BS, KV_LORA=kv_lora, ROPE=rope, ROPE_PAD=rope_pad,
         BLOCK_H=block_h, BLOCK_N=block_n, num_warps=8,
     )
     grid2 = (N, (H + block_h - 1) // block_h)

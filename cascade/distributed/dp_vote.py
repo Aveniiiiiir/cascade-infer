@@ -40,16 +40,20 @@ class DPStepVoter:
     @staticmethod
     def exchange_flags(local_has_prefill: bool, group=None) -> list[bool]:
         """两轮 gloo allreduce 的本地等价：交换各 rank 的标志。
-        集群用法：dist.all_gather_object；无分布式（单 rank）→ [local]。"""
+        集群用法：dist.all_gather_object；无分布式（单 rank）→ [local]。
+
+        审查 #15：分布式运行时错误**不再吞掉**——静默降级为 [local] 会让
+        本 rank 与其他 rank 的 step 型决策分歧 → DP 组集体通信 hang。
+        只有「torch.distributed 不可用/未初始化」才是合法的单 rank 回退。
+        """
         try:
             import torch.distributed as dist
-
-            if dist.is_available() and dist.is_initialized():
-                flags = [None] * dist.get_world_size(group=group)
-                dist.all_gather_object(flags, local_has_prefill, group=group)
-                return [bool(f) for f in flags]
-        except Exception:  # pragma: no cover
-            pass
+        except ImportError:  # pragma: no cover - 无 torch 的 CPU 环境
+            return [local_has_prefill]
+        if dist.is_available() and dist.is_initialized():
+            flags = [None] * dist.get_world_size(group=group)
+            dist.all_gather_object(flags, local_has_prefill, group=group)
+            return [bool(f) for f in flags]
         return [local_has_prefill]
 
 

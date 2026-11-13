@@ -85,6 +85,11 @@ def mtp_verify(
             n_accepted += 1
         else:
             residual = torch.relu(q[j] - _ALPHA * draft_logprobs[j].exp())
+            # 残差全零（draft 分布在所有列都 ≥ target/α）时回退到 target
+            # 分布 q 本身——拒绝采样的偏差界允许此退化（DeepInfer 同语义），
+            # 否则 _inv_cdf 对全零行报错杀死请求
+            if float(residual.sum()) <= 0.0:
+                residual = q[j]
             token = _inv_cdf(residual, float(sample_u[j]))
             row_tokens.append(token)
             accepted.append(False)
@@ -109,7 +114,8 @@ def _inv_cdf(probs: torch.Tensor, u: float) -> int:
     target = u * float(cdf[-1])
     mask = cdf > target
     if bool(mask.any()):
-        return int(torch.argmax(mask).item())
+        # Bool argmax 在 torch 未实现（"argmax_cpu" not implemented for 'Bool'）
+        return int(mask.long().argmax().item())
     for i in range(probs.numel() - 1, -1, -1):
         if float(probs[i]) > 0:
             return i
