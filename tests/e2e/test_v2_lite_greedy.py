@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import gc
 import os
 
 import pytest
@@ -53,12 +54,17 @@ PROMPTS = [
 
 
 def _hf_greedy_all(model_dir: str, prompts: list[str], max_tokens: int) -> list[list[int]]:
-    """HF 参考输出（模型只加载一次；逐条贪心）。"""
+    """HF 参考输出（模型只加载一次；逐条贪心）。
+
+    设备可用 CASCADE_E2E_HF_DEVICE 覆盖（cuda / cpu）——显存紧张时把参考
+    模型放 CPU（主机内存需 ≥ 模型大小，且很慢）。
+    """
     import transformers
 
+    hf_device = os.environ.get("CASCADE_E2E_HF_DEVICE", "cuda")
     tok = transformers.AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
     model = transformers.AutoModelForCausalLM.from_pretrained(
-        model_dir, torch_dtype=torch.bfloat16, device_map="cuda", trust_remote_code=True
+        model_dir, torch_dtype=torch.bfloat16, device_map=hf_device, trust_remote_code=True
     )
     model.eval()
     outs = []
@@ -67,14 +73,16 @@ def _hf_greedy_all(model_dir: str, prompts: list[str], max_tokens: int) -> list[
             ids = tok.encode(p)
             out = list(ids)
             for _ in range(max_tokens):
-                x = torch.tensor([out], device="cuda")
+                x = torch.tensor([out], device=hf_device)
                 nxt = int(model(x).logits[0, -1].argmax().item())
                 out.append(nxt)
                 if nxt == tok.eos_token_id:
                     break
             outs.append(out)
     del model
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        gc.collect()
+        torch.cuda.empty_cache()
     return outs
 
 
@@ -91,6 +99,13 @@ def test_greedy_tokens_match_hf() -> None:
     )
     prompt_ids = [tok.encode(p) for p in PROMPTS]
     results = llm._engine.generate(prompt_ids, sp)
+
+    # **显存关键**：Cascade 权重（V2-Lite bf16 ≈ 29.3 GiB）与 KV 必须在上卡
+    # HF 参考模型之前释放——两份模型同时驻留需 ~59 GiB，48GB 卡也放不下。
+    # 释放后单模型峰值 ≈ 29.3 GiB 权重 + 上下文/激活，32GB 卡可跑（偏紧）。
+    del llm
+    gc.collect()
+    torch.cuda.empty_cache()
 
     # --- HF 参考 ---
     hf_outs = _hf_greedy_all(model_dir, PROMPTS, MAX_TOKENS)
