@@ -19,8 +19,18 @@ except ImportError:  # pragma: no cover - Windows/无 GPU 环境
 
 
 def use_triton(device) -> bool:
-    """Triton kernel 可用且张量在 CUDA 上。"""
-    return HAS_TRITON and str(device).startswith("cuda")
+    """Triton kernel 可用且张量在 CUDA 上。
+
+    逃生门（CASCADE_DISABLE_TRITON=1）：强制全部走 PyTorch 参考路径——
+    新架构（如 Blackwell sm_120）上 Triton 编译异常时，引擎仍可正确运行
+    （慢），便于隔离「kernel 问题」与「引擎问题」。图捕获请同时关
+    CASCADE_CUDAGRAPH（ref 路径含 .item()，不可捕获）。
+    """
+    if not str(device).startswith("cuda") or not HAS_TRITON:
+        return False
+    from cascade.common.env import envs
+
+    return not envs.DISABLE_TRITON
 
 
 __all__ = ["HAS_TRITON", "use_triton", "triton", "tl"]
