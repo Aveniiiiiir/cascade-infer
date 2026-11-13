@@ -9,6 +9,7 @@ V2-Lite bf16 直读；V3 原生 FP8 checkpoint 的 blockwise 反量化在 Phase 
 
 from __future__ import annotations
 
+import gc
 import json
 import re
 from dataclasses import dataclass, field
@@ -46,12 +47,36 @@ def _shard_files(model_dir: Path) -> list[Path]:
     raise FileNotFoundError(f"no safetensors found under {model_dir}")
 
 
+def _construct_model(cfg: ModelConfig, dtype: torch.dtype) -> DeepseekV2ForCausalLM:
+    """按目标 dtype 直接构造模型骨架（关键内存优化）。
+
+    默认构造是 fp32：V2-Lite 15.7B 参数 × 4B ≈ 63GB 主机内存，且
+    `model.to(dtype)` 会在 fp32 骨架之外再分配一份 bf16 副本（瞬时 ~92GB）
+    ——62GB 内存机器连加载都过不去。以 bf16 直接构造后骨架 ≈29GB，
+    `.to(device, dtype)` 退化为纯搬运（无 dtype 转换副本）。
+    """
+    prev = torch.get_default_dtype()
+    try:
+        try:
+            torch.set_default_dtype(dtype)
+        except (TypeError, RuntimeError):  # pragma: no cover - 老版本 torch
+            _log.warning("set_default_dtype(%s) 不可用，按默认 fp32 构造（内存峰值翻倍）", dtype)
+        return DeepseekV2ForCausalLM(cfg, device="cpu")
+    finally:
+        torch.set_default_dtype(prev)
+
+
 def load_deepseek_v2(
     model_dir: str | Path,
     device: str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
 ) -> tuple[DeepseekV2ForCausalLM, ModelConfig]:
-    """加载 checkpoint（CPU 组装 → cast → 搬运到 device）。"""
+    """加载 checkpoint（按 dtype 构造 → 逐分片赋值 → 搬运到 device）。
+
+    内存峰值 ≈ 模型骨架（dtype 大小）+ 单个 shard，而非
+    骨架 + 全量 state dict —— V2-Lite（~29GB bf16 / 4 个 shard）峰值
+    ~37GB，62GB 主机内存可容纳。
+    """
     import safetensors.torch  # 局部导入：集群/CI 才有
 
     model_dir = Path(model_dir)
@@ -59,14 +84,22 @@ def load_deepseek_v2(
     cfg = ModelConfig.from_hf_dict(hf_dict)
     fp8_mode = "quantization_config" in hf_dict  # V3 原生 FP8：加载期反量化到 bf16
 
-    model = DeepseekV2ForCausalLM(cfg, device="cpu")
+    model = _construct_model(cfg, dtype)
     files = _shard_files(model_dir)
-    state: dict[str, torch.Tensor] = {}
+    report = LoadReport()
+    covered: set[str] = set()
+    expert_seen: dict[str, set[int]] = {}
     for f in files:
-        state.update(safetensors.torch.load_file(str(f)))
-    if fp8_mode:
-        state = _dequant_fp8_state(state)
-    report = _assign(model, state, dtype, tie_word_embeddings=cfg.tie_word_embeddings)
+        shard = safetensors.torch.load_file(str(f))
+        if fp8_mode:
+            # 注：V3 官方 checkpoint 的 *_scale_inv 可能独立分片——按 shard
+            # 反量化要求权重与尺度同片（当前 v3 已在 config 层拒绝，
+            # 该路径仅 test_fp8_loader 的单片合成 checkpoint 使用）
+            shard = _dequant_fp8_state(shard)
+        _assign_shard(model, shard, dtype, report, covered, expert_seen)
+        del shard
+        gc.collect()  # 压住分片副本，峰值只留骨架 + 当前 shard
+    _finish_missing(model, report, covered, expert_seen, cfg.tie_word_embeddings)
     if cfg.tie_word_embeddings:
         model.tie_weights()
     model.to(device=device, dtype=dtype, non_blocking=True)
@@ -124,22 +157,19 @@ def _dequant_blockwise(w: torch.Tensor, scale: torch.Tensor, block: int = 128) -
     return (w.to(torch.float32) * s).to(torch.bfloat16)
 
 
-def _assign(
+def _assign_shard(
     model: torch.nn.Module,
     state: dict[str, torch.Tensor],
     dtype: torch.dtype,
-    tie_word_embeddings: bool = False,
-) -> LoadReport:
-    """审查 #12：missing 报告保真——
-    - lm_head.weight 仅在 tie_word_embeddings 时从 missing 排除（此前无条件
-      排除：非 tie checkpoint 缺 lm_head → 随机初始化 → 静默垃圾输出）；
-    - 专家堆叠参数按 (name, expert_idx) 粒度记录（此前任一专家键加载就把
-      整个 w1/w3/w2 标记 covered：部分专家缺失被掩盖 → 零权重专家）。
+    report: LoadReport,
+    covered: set[str],
+    expert_seen: dict[str, set[int]],
+) -> None:
+    """把一个 shard 的键值赋进模型参数（流式加载的单片入口）。
+
+    covered / expert_seen 跨片累积；missing 由 _finish_missing 收尾计算。
     """
-    report = LoadReport()
     own = model.state_dict()
-    covered: set[str] = set()  # 已赋值的普通参数名
-    expert_seen: dict[str, set[int]] = {}  # 堆叠参数名 → 已加载的专家切片
     for key, tensor in state.items():
         report.num_tensors += 1
         report.num_bytes += tensor.numel() * tensor.element_size()
@@ -168,6 +198,22 @@ def _assign(
         else:
             target.copy_(tensor.to(dtype))
         covered.add(key)
+
+
+def _finish_missing(
+    model: torch.nn.Module,
+    report: LoadReport,
+    covered: set[str],
+    expert_seen: dict[str, set[int]],
+    tie_word_embeddings: bool,
+) -> None:
+    """审查 #12：missing 报告保真——
+    - lm_head.weight 仅在 tie_word_embeddings 时从 missing 排除（此前无条件
+      排除：非 tie checkpoint 缺 lm_head → 随机初始化 → 静默垃圾输出）；
+    - 专家堆叠参数按 (name, expert_idx) 粒度记录（此前任一专家键加载就把
+      整个 w1/w3/w2 标记 covered：部分专家缺失被掩盖 → 零权重专家）。
+    """
+    own = model.state_dict()
     report.missing = [
         k
         for k in own
@@ -178,6 +224,20 @@ def _assign(
     for name, seen in expert_seen.items():
         num_experts = own[name].shape[0]
         report.missing.extend(f"{name}[{e}]" for e in range(num_experts) if e not in seen)
+
+
+def _assign(
+    model: torch.nn.Module,
+    state: dict[str, torch.Tensor],
+    dtype: torch.dtype,
+    tie_word_embeddings: bool = False,
+) -> LoadReport:
+    """整 state dict 的便利入口（测试/小 checkpoint 用；生产走流式）。"""
+    report = LoadReport()
+    covered: set[str] = set()
+    expert_seen: dict[str, set[int]] = {}
+    _assign_shard(model, state, dtype, report, covered, expert_seen)
+    _finish_missing(model, report, covered, expert_seen, tie_word_embeddings)
     return report
 
 
