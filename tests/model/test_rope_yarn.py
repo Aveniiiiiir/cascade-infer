@@ -100,5 +100,19 @@ def test_apply_shapes_and_dtype() -> None:
     q2, k2 = rope.apply(q, k, pos)
     assert q2.shape == q.shape and k2.shape == k.shape
     assert q2.dtype == torch.bfloat16 and k2.dtype == torch.bfloat16
-    # 位置 0：cos=1, sin=0 → q 不变
-    torch.testing.assert_close(q2[0], q[0])
+    # 位置 0：cos=1, sin=0 → 输出 = interleaved→half-split 置换（非恒等，
+    # 与官方 DeepSeek modeling 一致）
+    from cascade.model_executor.layers.rotary import _interleaved_to_half
+
+    torch.testing.assert_close(q2[0], _interleaved_to_half(q)[0])
+
+
+def test_interleaved_to_half_permutation() -> None:
+    """与官方 q.view(d//2, 2).transpose(-1, -2).reshape() 逐元素一致。"""
+    from cascade.model_executor.layers.rotary import _interleaved_to_half
+
+    x = torch.arange(2 * 3 * 8, dtype=torch.float32).reshape(2, 3, 8)
+    ref = x.view(2, 3, 4, 2).transpose(-1, -2).reshape(2, 3, 8)
+    assert torch.equal(_interleaved_to_half(x), ref)
+    # 索引语义：[0,2,4,6,1,3,5,7]
+    assert _interleaved_to_half(x)[0, 0].tolist() == [0, 2, 4, 6, 1, 3, 5, 7]

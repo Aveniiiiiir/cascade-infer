@@ -165,11 +165,18 @@ class RotaryEmbedding:
         k: torch.Tensor,
         positions: torch.Tensor,
         ensure: bool = True,
+        interleaved: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """q/k: [..., head_dim]（最后一维 rope）。positions: 同 broadcast 到 [...,] 的绝对位置。
 
         NeoX rotate_half: x' = x*cos + rotate_half(x)*sin，
         rotate_half(x) = concat(-x[..., d/2:], x[..., :d/2])。
+
+        interleaved=True（DeepSeek 系默认）：输入 q_pe/k_pe 为 interleaved
+        布局（实部/虚部成对），先转 half-split 再旋转——与官方
+        `apply_rotary_pos_emb` 的 q.view(d//2, 2).transpose().reshape() 一致。
+        此前按 half-split 直接处理导致整个 rope 语义错误（位置 0 都不恒等，
+        真实模型 e2e 20/20 分歧的根因）。
 
         ensure=True（默认，测试/直调安全）：按需扩容缓冲（含一次
         positions.max().item() 的 CPU-GPU 同步）。
@@ -181,6 +188,9 @@ class RotaryEmbedding:
         if ensure and positions.numel():
             max_pos = int(positions.max().item()) + 1
             self._ensure(max_pos)
+        if interleaved:
+            q = _interleaved_to_half(q)
+            k = _interleaved_to_half(k)
         # cos/sin 索引后为 [T, dim]。q 为 [T, heads, dim]（多头）时需
         # unsqueeze(1) 广播到头维；k 可能是 [T, dim]（MQA 单流）或
         # [T, heads, dim]，按各自 ndim 处理（此前 q/k 共用同一 cos_p，
@@ -197,6 +207,20 @@ class RotaryEmbedding:
         q2 = q * cos_q + _rotate_half(q) * sin_q
         k2 = k * cos_k + _rotate_half(k) * sin_k
         return q2.to(q.dtype), k2.to(k.dtype)
+
+
+def _interleaved_to_half(x: torch.Tensor) -> torch.Tensor:
+    """interleaved → half-split（官方 DeepSeek modeling 的同一变换）。
+
+    DeepSeek 系 checkpoint 的 q_pe/k_pe 以 interleaved 布局存储：
+    每对 (d_{2i}, d_{2i+1}) 是同一频率的 (实部, 虚部)。标准 rotate_half
+    需要 half-split 布局（前半实部、后半虚部）。官方
+    `apply_rotary_pos_emb` 在乘 cos/sin 之前执行：
+        q.view(..., d//2, 2).transpose(-1, -2).reshape(..., d)
+    等价于索引重排 [0,2,4,...,1,3,5,...]。
+    """
+    d = x.shape[-1]
+    return x.reshape(*x.shape[:-1], d // 2, 2).transpose(-1, -2).reshape(x.shape)
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:

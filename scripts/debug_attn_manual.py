@@ -62,6 +62,8 @@ def hf_manual(x: torch.Tensor):
         kn, v = kvb[..., :NOPE], kvb[..., NOPE:]
         kpe = kpe.view(1, L, 1, ROPE).transpose(1, 2)
         cos, sin = a.rotary_emb(v, seq_len=L)
+        # 注意 pos 已是 [1, L]，传给 apply_rotary_pos_emb 时不要再 unsqueeze
+        # （多加一维会让 cos 变 5D，静默广播出错误结果）
         qp2, kpe2 = apply_rotary_pos_emb(qp, kpe, cos, sin, pos)
         query = torch.cat((qn, qp2), dim=-1)
         key = torch.cat((kn, kpe2.expand(1, H, L, ROPE)), dim=-1)
@@ -73,9 +75,10 @@ def hf_manual(x: torch.Tensor):
         w = torch.softmax(scores_m, dim=-1, dtype=torch.float32).to(query.dtype)
         out = torch.matmul(w, v)
     res = dict(
-        scores=scores_m.float().cpu(),
+        scores=scores.float().cpu(),
         w=w.float().cpu(),
         out=out.float().cpu(),
+        qp_pre=qp.float().cpu(),
         qp2=qp2.float().cpu(),
         kpe2=kpe2.float().cpu(),
         scale=a.softmax_scale,
@@ -109,11 +112,12 @@ def cascade_manual(x: torch.Tensor):
         w = torch.softmax(scores_m, dim=-1, dtype=torch.float32).to(query.dtype)
         out = torch.matmul(w, v.transpose(0, 1).unsqueeze(0))
     res = dict(
-        scores=scores_m.float().cpu(),
+        scores=scores.float().cpu(),
         w=w.float().cpu(),
         out=out.float().cpu(),
+        qp_pre=qp.transpose(0, 1).unsqueeze(0).float().cpu(),
         qp2=qp2.transpose(0, 1).unsqueeze(0).float().cpu(),
-        kpe2=kpe2.float().cpu(),
+        kpe2=kpe2.view(1, 1, L, ROPE).float().cpu(),
         scale=a.scale,
     )
     del model
@@ -127,13 +131,17 @@ def main() -> None:
     h = hf_manual(x)
     c = cascade_manual(x)
     print("scale hf/cascade:", h["scale"], c["scale"])
-    for k in ("qp2", "kpe2", "scores", "w", "out"):
+    for k in ("qp_pre", "qp2", "kpe2", "scores", "w", "out"):
         a, b = h[k], c[k]
         if a.shape != b.shape:
             print(f"{k}: shape {tuple(a.shape)} vs {tuple(b.shape)}")
             continue
         d = (a - b).abs()
         print(f"{k}: max|d|={d.max().item():.6f} mean|d|={d.mean().item():.6f}")
+    print("hf qp2[0,0,0,:6]:", h["qp2"][0, 0, 0, :6].tolist())
+    print("cs qp2[0,0,0,:6]:", c["qp2"][0, 0, 0, :6].tolist())
+    print("hf qp2[0,0,1,:6]:", h["qp2"][0, 0, 1, :6].tolist())
+    print("cs qp2[0,0,1,:6]:", c["qp2"][0, 0, 1, :6].tolist())
 
 
 if __name__ == "__main__":
