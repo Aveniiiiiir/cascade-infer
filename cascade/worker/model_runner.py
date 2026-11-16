@@ -99,10 +99,14 @@ class ModelRunner:
         model_cfg: ModelConfig | None = None,
         draft_model=None,
     ) -> None:
+        from cascade.common.env import envs
+
         self.engine_cfg = engine_cfg
         self.device = device
         self.dtype = dtype
-        self.use_absorbed = use_absorbed
+        # CASCADE_ABSORBED=0：走显式路径（kv_b_proj 材料化 k/v，与 HF
+        # 数值路径完全一致）——用于 e2e 逐 token 对拍；生产默认吸收路径
+        self.use_absorbed = use_absorbed and bool(envs.ABSORBED)
         self.sampler = Sampler()
         #: MTP：草案模型（DraftModel 协议）与上一轮草案状态
         self.draft_model = draft_model

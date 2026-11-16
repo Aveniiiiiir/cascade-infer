@@ -26,8 +26,12 @@ def kv_bytes_per_block(model_cfg: ModelConfig, block_size: int, dtype: str = "bf
 
 
 def kv_total_bytes(model_cfg: ModelConfig, num_blocks: int, block_size: int, dtype: str = "bf16") -> int:
-    """整个 KV 池的字节数（所有层 × 所有 block）。"""
-    return kv_bytes_per_block(model_cfg, block_size, dtype) * model_cfg.num_layers * num_blocks
+    """整个 KV 池的字节数（所有层 × (num_blocks + 1) 个 slot）。
+
+    +1：block id 0 是保留的空块（BlockManager 的 block id 为 1..num_blocks），
+    KV 张量必须能容纳 id = num_blocks。
+    """
+    return kv_bytes_per_block(model_cfg, block_size, dtype) * model_cfg.num_layers * (num_blocks + 1)
 
 
 def derive_num_blocks(
@@ -43,8 +47,13 @@ def derive_num_blocks(
 
 
 def kv_shape(model_cfg: ModelConfig, num_blocks: int, block_size: int) -> tuple[int, int, int, int]:
-    """KV 张量形状: [num_layers, num_blocks, block_size, kv_cache_dim]。"""
-    return (model_cfg.num_layers, num_blocks, block_size, model_cfg.kv_cache_dim)
+    """KV 张量形状: [num_layers, num_blocks + 1, block_size, kv_cache_dim]。
+
+    行 0 是保留的空块：BlockManager 分配的 block id 是 1..num_blocks，
+    若只分配 num_blocks 行，id = num_blocks 会越界（explicit 路径
+    PyTorch 索引直接 assert；absorbed kernel 手写地址则静默越界读写）。
+    """
+    return (model_cfg.num_layers, num_blocks + 1, block_size, model_cfg.kv_cache_dim)
 
 
 __all__ = [

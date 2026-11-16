@@ -27,10 +27,11 @@ def test_bytes_per_block() -> None:
 
 
 def test_total_bytes_and_shape() -> None:
+    """block id 0 保留 → 张量行数 = num_blocks + 1（id 最大值是 num_blocks）。"""
     cfg = make_cfg(num_layers=27)
     blocks = 100
-    assert kv_total_bytes(cfg, blocks, 64) == 576 * 2 * 64 * 27 * 100
-    assert kv_shape(cfg, blocks, 64) == (27, 100, 64, 576)
+    assert kv_total_bytes(cfg, blocks, 64) == 576 * 2 * 64 * 27 * 101
+    assert kv_shape(cfg, blocks, 64) == (27, 101, 64, 576)
 
 
 def test_derive_num_blocks() -> None:

@@ -81,6 +81,9 @@ class _EnvNamespace:
     #: 强制 Triton 算子全部走 PyTorch 参考路径（新架构 Triton 编译异常时的
     #: 逃生门；慢，但保证引擎可运行。图捕获需同时关 CASCADE_CUDAGRAPH）。
     DISABLE_TRITON = _EnvDescriptor("CASCADE_DISABLE_TRITON", int, 0)
+    #: 1 = MLA 吸收路径（生产默认）；0 = 显式路径（与 HF 数值路径一致，
+    #: 用于逐 token e2e 对拍；更慢）
+    ABSORBED = _EnvDescriptor("CASCADE_ABSORBED", int, 1)
     #: regenerate golden files instead of comparing against them (tests only).
     REGEN_GOLDEN = _EnvDescriptor("CASCADE_REGEN_GOLDEN", int, 0)
     #: ZOS invariant checker in the hot loop (debug only).
