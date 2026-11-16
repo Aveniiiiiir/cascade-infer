@@ -111,6 +111,18 @@ class Sampler:
         return probs
 
 
+def _seed_to_i64(seed: int) -> int:
+    """uint64 → int64 位模式（torch int64 不接受 ≥2^63 的 Python int）。
+
+    SamplingParams 的 seq_seed 取值域是 uint64（random.getrandbits(64)
+    约 50% 落在 ≥2^63）——直接 torch.tensor(..., int64) 会
+    "Overflow when unpacking long"。采样内核按 uint64 位模式解释 int64，
+    因此这里只是重解释、不改变随机流。
+    """
+    seed &= (1 << 64) - 1
+    return seed if seed < (1 << 63) else seed - (1 << 64)
+
+
 def build_sampling_rows(
     per_row: list[tuple[str, SamplingScalars, int, int]],  # (rid, snapshot, 新 token 绝对位置, golden)
     device: str,
@@ -131,7 +143,11 @@ def build_sampling_rows(
         temperatures=torch.tensor([s.temperature for _, s, _, _ in per_row], dtype=torch.float32, device=device),
         top_ps=torch.tensor([s.top_p for _, s, _, _ in per_row], dtype=torch.float32, device=device),
         top_ks=torch.tensor([s.top_k for _, s, _, _ in per_row], dtype=torch.int32, device=device),
-        seq_seeds=torch.tensor([s.seq_seed for _, s, _, _ in per_row], dtype=torch.int64, device=device),
+        seq_seeds=torch.tensor(
+            [_seed_to_i64(s.seq_seed) for _, s, _, _ in per_row],
+            dtype=torch.int64,
+            device=device,
+        ),
         positions=torch.tensor([p for _, _, p, _ in per_row], dtype=torch.int64, device=device),
         goldens=torch.tensor([g for _, _, _, g in per_row], dtype=torch.int32, device=device),
         request_ids=[rid for rid, _, _, _ in per_row],

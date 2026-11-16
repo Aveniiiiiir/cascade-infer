@@ -254,15 +254,21 @@ class MLAAttention(nn.Module):
         v = kv_b[..., self.qk_nope :]  # [P, h, 128]
         q_full = torch.cat((q_nope, q_rope), dim=-1)  # [L, h, 192]
         k_full = torch.cat((k_nope, k_rope_kv.unsqueeze(1).expand(P, self.num_heads, self.qk_rope)), dim=-1)
-        # fp32 分数 + 位置 causal 掩码
-        scores = torch.einsum("lhd,phd->hlp", q_full.float(), k_full.float()) * self.scale
+        # 数值路径与 HF 逐算子对齐：4D 批量 matmul（[1, h, L, D] ×
+        # [1, h, D, P]）→ fp32 softmax → 转回 bf16 → bf16 matmul。
+        # einsum 的 3D bmm 会选到不同的 cuBLAS kernel/累加顺序，与 HF 的
+        # 4D matmul 有可观测差异（layer0 输出 max|d| ≈ 0.4）。
+        q4 = q_full.transpose(0, 1).unsqueeze(0)  # [1, h, L, D]
+        k4 = k_full.transpose(0, 1).unsqueeze(0)  # [1, h, P, D]
+        v4 = v.transpose(0, 1).unsqueeze(0)  # [1, h, P, Dv]
+        scores = torch.matmul(q4, k4.transpose(2, 3)) * self.scale
         # mask[q_pos, k_pos] = positions[q] >= k：unsqueeze(1) 使 positions 成为
         # 列向量 [L,1]，与 arange(P) 行向量 [1,P] 广播为 [L,P]（此前
         # unsqueeze(0) 得到的是转置的 [P,L]，L==P 时掩码方向错误）
         mask = positions.unsqueeze(1) >= torch.arange(P, device=positions.device).unsqueeze(0)  # [L,P]
-        scores = scores.masked_fill(~mask.unsqueeze(0), float("-inf"))
-        w = torch.softmax(scores, dim=-1)
-        out = torch.einsum("hlp,phd->lhd", w, v.float()).to(v.dtype)  # [L, h, 128]
+        scores = scores.masked_fill(~mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+        w = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q4.dtype)
+        out = torch.matmul(w, v4).squeeze(0).transpose(0, 1)  # [L, h, Dv]
         L = q_nope.shape[0]
         return out.reshape(L, self.num_heads * self.v_head)
 

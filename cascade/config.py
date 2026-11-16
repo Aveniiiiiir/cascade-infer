@@ -11,6 +11,7 @@ DeepSeek-V2 family (V2 / V2-Lite)。deepseek_v3 显式拒绝（关键数学未�
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 _MLA_NUM_KV_HEADS = 1  # MLA latent KV: single shared KV stream (MQA-like)
@@ -55,6 +56,8 @@ class ModelConfig:
     #: MoE 分组路由（V2-Lite/V2.5/V3 的 n_group/topk_group；0 = 不分组）
     n_group: int = 0
     topk_group: int = 0
+    #: RoPE 长度外推配置（V2-Lite: {"type": "yarn", "factor": 40, ...}）
+    rope_scaling: dict | None = None
 
     # --- MTP（V2 无; V3 = 1 层 nextn）---
     num_nextn_predict_layers: int = 0
@@ -73,7 +76,22 @@ class ModelConfig:
 
     @property
     def softmax_scale(self) -> float:
-        return self.qk_head_dim**-0.5
+        """1/sqrt(qk_head_dim)，YaRN 下再乘 mscale²（HF 官方语义）。
+
+        V2-Lite 的 rope_scaling 给出 mscale_all_dim=0.707 → 官方
+        `DeepseekV2Attention.__init__` 在 mscale_all_dim 非零时把
+        softmax_scale 乘 `yarn_get_mscale(factor, mscale_all_dim) ** 2`
+        （≈1.59）。缺这一项会让 attention 分布系统性偏移（e2e 20/20
+        分歧的根因）。
+        """
+        scale = self.qk_head_dim**-0.5
+        rs = self.rope_scaling or {}
+        mscale_all_dim = rs.get("mscale_all_dim", 0)
+        factor = float(rs.get("factor", 1.0))
+        if mscale_all_dim and factor > 1:
+            m = 0.1 * float(mscale_all_dim) * math.log(factor) + 1.0
+            scale *= m * m
+        return scale
 
     @property
     def num_dense_layers(self) -> int:
@@ -147,6 +165,7 @@ class ModelConfig:
             norm_topk_prob=bool(d.get("norm_topk_prob", False)),
             n_group=int(d.get("n_group") or 0),
             topk_group=int(d.get("topk_group") or 0),
+            rope_scaling=d.get("rope_scaling"),
             num_nextn_predict_layers=int(d.get("num_nextn_predict_layers", 0)),
         )
         cfg.validate()

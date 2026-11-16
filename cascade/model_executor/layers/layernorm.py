@@ -13,10 +13,12 @@ class RMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """与 HF DeepseekV2RMSNorm 数值路径一致：
+        fp32 归一化 → 转回模型 dtype → 乘 weight（weight 已在模型 dtype）。"""
         dtype = x.dtype
         x = x.to(torch.float32)
         x = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.variance_epsilon)
-        return (self.weight.to(torch.float32) * x).to(dtype)
+        return self.weight * x.to(dtype)
 
 
 __all__ = ["RMSNorm"]

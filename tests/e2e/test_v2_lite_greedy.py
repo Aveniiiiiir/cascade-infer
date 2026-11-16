@@ -53,20 +53,65 @@ PROMPTS = [
 ]
 
 
+def _hf_compat_patches() -> None:
+    """让模型目录的官方 modeling_deepseek.py 在 transformers 4.5x 下可加载。
+
+    官方实现是**权威参考**：它自带 YaRN rope（与 Cascade 公式一致）；
+    transformers 内置实现会因 config 里 rope_scaling 的 int 类型校验而
+    拒绝 YaRN（静默回退 plain rope），不能作为对拍基准。
+
+    需要的三处兼容：
+    1. flash_attn：官方 modeling 在 import 期硬检查；stub 一个低版本模块
+       （显式传 attn_implementation="eager"，不会真正调用它）
+    2. is_torch_fx_available：transformers 4.5x 已移除
+    3. DynamicCache.get_usable_length：4.5x 已移除（我们传 use_cache=False，
+       仅 import 期兜底）
+    """
+    import sys
+    import types
+
+    if "flash_attn" not in sys.modules:
+        import importlib.machinery
+
+        fa = types.ModuleType("flash_attn")
+        fa.__version__ = "0.0.0"  # 低于 is_flash_attn_2_available 门槛
+        fa.__spec__ = importlib.machinery.ModuleSpec("flash_attn", None)
+        fa.flash_attn_func = lambda *a, **k: None
+        fa.flash_attn_varlen_func = lambda *a, **k: None
+        sys.modules["flash_attn"] = fa
+
+    import transformers.utils.import_utils as iu
+
+    if not hasattr(iu, "is_torch_fx_available"):
+        iu.is_torch_fx_available = lambda: False
+
+    from transformers.cache_utils import DynamicCache
+
+    if not hasattr(DynamicCache, "get_usable_length"):
+        DynamicCache.get_usable_length = lambda self, seq_length: self.get_seq_length()
+
+
 def _hf_greedy_all(model_dir: str, prompts: list[str], max_tokens: int) -> list[list[int]]:
     """HF 参考输出（模型只加载一次；逐条贪心）。
 
     设备可用 CASCADE_E2E_HF_DEVICE 覆盖（cuda / cpu）——显存紧张时把参考
     模型放 CPU（主机内存需 ≥ 模型大小，且很慢）。
     """
+    _hf_compat_patches()
     import transformers
 
     hf_device = os.environ.get("CASCADE_E2E_HF_DEVICE", "cuda")
     tok = transformers.AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
     model = transformers.AutoModelForCausalLM.from_pretrained(
-        model_dir, torch_dtype=torch.bfloat16, device_map=hf_device, trust_remote_code=True
+        model_dir,
+        torch_dtype=torch.bfloat16,
+        device_map=hf_device,
+        trust_remote_code=True,  # 官方 modeling_deepseek.py（自带 YaRN rope）
+        attn_implementation="eager",  # 不用 flash-attn stub
     )
     model.eval()
+    if hasattr(model.config, "use_cache"):
+        model.config.use_cache = False
     outs = []
     with torch.no_grad():
         for p in prompts:
@@ -74,7 +119,7 @@ def _hf_greedy_all(model_dir: str, prompts: list[str], max_tokens: int) -> list[
             out = list(ids)
             for _ in range(max_tokens):
                 x = torch.tensor([out], device=hf_device)
-                nxt = int(model(x).logits[0, -1].argmax().item())
+                nxt = int(model(x, use_cache=False).logits[0, -1].argmax().item())
                 out.append(nxt)
                 if nxt == tok.eos_token_id:
                     break

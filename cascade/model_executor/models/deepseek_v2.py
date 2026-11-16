@@ -63,7 +63,10 @@ class DeepseekV2Model(nn.Module):
             [DeepseekV2DecoderLayer(cfg, i) for i in range(cfg.num_layers)]
         )
         self.norm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
-        self.rope = RotaryEmbedding(cfg.qk_rope_head_dim, cfg.rope_theta, device=device)
+        self.rope = RotaryEmbedding(
+            cfg.qk_rope_head_dim, cfg.rope_theta, device=device,
+            rope_scaling=cfg.rope_scaling,  # V2-Lite/V2.5 的 YaRN 外推
+        )
         self.device = device
 
     def forward(
@@ -140,18 +143,19 @@ class DeepseekV2ForCausalLM(nn.Module):
             self.lm_head.weight = self.model.embed_tokens.weight
 
     def to(self, *args, **kwargs):
-        """nn.Module.to 之外同步 rope 缓冲设备。
+        """nn.Module.to 之外同步 rope 缓冲的设备与 dtype。
 
         RotaryEmbedding 不是 nn.Module，cos/sin 缓冲不随 model.to 迁移——
         CPU 构造后上卡（真实模型路径）时若不显式迁移，apply 的
-        cos[positions] 会因设备不匹配报错（e2e 暴露）。
+        cos[positions] 会因设备不匹配报错（e2e 暴露）。dtype 也需对齐
+        （HF 的 rope 在模型 dtype 下计算）。
         """
         super().to(*args, **kwargs)
-        device = kwargs.get("device", args[0] if args else None)
-        if device is not None:
-            rope = getattr(self.model, "rope", None)
-            if rope is not None and hasattr(rope, "to"):
-                rope.to(device)
+        rope = getattr(self.model, "rope", None)
+        if rope is not None and hasattr(rope, "to"):
+            p = next(self.parameters(), None)
+            if p is not None:
+                rope.to(p.device, p.dtype)
         return self
 
 

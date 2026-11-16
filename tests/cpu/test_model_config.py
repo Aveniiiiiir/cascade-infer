@@ -88,11 +88,14 @@ def test_from_hf_dict_rejects_v3_explicitly() -> None:
         ModelConfig.from_hf_dict(d)
 
 
-def test_mla_kv_heads_must_be_1() -> None:
-    d = dict(V2_LITE_CONFIG)
-    d["num_key_value_heads"] = 8
-    with pytest.raises(AssertionError, match="num_key_value_heads"):
-        ModelConfig.from_hf_dict(d)
+def test_mla_kv_heads_normalized_to_single_stream() -> None:
+    """真实 V2-Lite config 的 num_key_value_heads=16（写成注意力头数），
+    MLA 的 KV 经 kv_a_proj_with_mqa 压缩为单流 latent —— 归一化为 1。"""
+    for n in (8, 16):
+        d = dict(V2_LITE_CONFIG)
+        d["num_key_value_heads"] = n
+        cfg = ModelConfig.from_hf_dict(d)
+        assert cfg.num_kv_heads == 1
 
 
 def test_fixture_file_roundtrip(tmp_path: Path) -> None:

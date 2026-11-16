@@ -107,7 +107,7 @@ def load_deepseek_v2(
     # 必须显式迁移（真实模型路径：CPU 构造后上卡）
     rope = getattr(getattr(model, "model", None), "rope", None)
     if rope is not None and hasattr(rope, "to"):
-        rope.to(device)
+        rope.to(device, dtype)
     _log.info(
         "loaded %s: %d tensors, %.2f GiB, missing=%d unexpected=%d",
         model_dir.name,
