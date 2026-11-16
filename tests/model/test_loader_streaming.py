@@ -82,12 +82,19 @@ def test_missing_report_flags_individual_experts() -> None:
     cfg = ModelConfig.from_hf_dict(_tiny_cfg_dict())
     model = _construct_model(cfg, torch.bfloat16)
     sd = {k: v.detach().clone() for k, v in model.state_dict().items()}
-    dropped = "model.layers.1.mlp.experts.2.gate_proj.weight"
-    assert dropped in sd
-    del sd[dropped]
+    # state_dict 存的是堆叠张量（w1/w3/w2）；HF checkpoint 用逐专家键
+    # （mlp.experts.E.*.weight）——删除其一以验证按专家粒度的 missing 上报
+    hf_expert_key = "model.layers.1.mlp.experts.2.gate_proj.weight"
+    assert "model.layers.1.mlp.w1" in sd
+    sd[hf_expert_key] = sd.pop("model.layers.1.mlp.w1")[2].clone()
     rep = _assign(model, sd, torch.bfloat16)
-    # 缺一个专家切片 → 必须报出该切片，而不是整层静默通过
-    assert "model.layers.1.mlp.w1[2]" in rep.missing
+    # 只提供 expert 2 的 gate_proj（其余 0/1/3 缺失）→ 必须逐片上报，
+    # 而不是整层静默通过
+    assert set(rep.missing) == {
+        "model.layers.1.mlp.w1[0]",
+        "model.layers.1.mlp.w1[1]",
+        "model.layers.1.mlp.w1[3]",
+    }, rep.missing
     assert not rep.unexpected
 
 
