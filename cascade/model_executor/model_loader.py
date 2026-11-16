@@ -103,6 +103,11 @@ def load_deepseek_v2(
     if cfg.tie_word_embeddings:
         model.tie_weights()
     model.to(device=device, dtype=dtype, non_blocking=True)
+    # RotaryEmbedding 不是 nn.Module——cos/sin 缓冲不随 model.to 迁移，
+    # 必须显式迁移（真实模型路径：CPU 构造后上卡）
+    rope = getattr(getattr(model, "model", None), "rope", None)
+    if rope is not None and hasattr(rope, "to"):
+        rope.to(device)
     _log.info(
         "loaded %s: %d tensors, %.2f GiB, missing=%d unexpected=%d",
         model_dir.name,

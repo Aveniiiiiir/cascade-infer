@@ -22,6 +22,21 @@ class RotaryEmbedding:
         self._sin: torch.Tensor | None = None
         self._ensure(1024)
 
+    def to(self, device: str | torch.device) -> "RotaryEmbedding":
+        """把 cos/sin/inv_freq 缓冲迁到目标设备。
+
+        真实模型路径：`DeepseekV2ForCausalLM(cfg, device="cpu")` 构造后
+        `model.to(cuda)`——RotaryEmbedding 不是 nn.Module，其缓冲不随
+        model.to 迁移，必须显式调用（e2e 真实模型首次上卡暴露）。
+        """
+        self.device = str(device)
+        self.inv_freq = self.inv_freq.to(device)
+        if self._cos is not None:
+            self._cos = self._cos.to(device)
+        if self._sin is not None:
+            self._sin = self._sin.to(device)
+        return self
+
     def _ensure(self, max_pos: int) -> None:
         if max_pos <= self._max_cached:
             return

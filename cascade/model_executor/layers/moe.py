@@ -50,8 +50,8 @@ class MoEGate(nn.Module):
             self.e_score_correction_bias = nn.Parameter(torch.zeros(cfg.n_routed_experts))
         else:
             self.e_score_correction_bias = None
-        self.n_group = 0  # V2-Lite: 0; V3 由 from_hf 覆盖（deepseek_v3.py）
-        self.topk_group = 0
+        self.n_group = cfg.n_group  # V2-Lite: 1（不分组语义等价）；V3: 8
+        self.topk_group = cfg.topk_group
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """x [T,H] → (topk_idx [T,k], topk_weight [T,k])（fp32 权重）。"""

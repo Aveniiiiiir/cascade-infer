@@ -52,6 +52,9 @@ class ModelConfig:
     scoring_func: str = "sigmoid"  # V2/V2.5/V3 家族; "softmax" 为旧 V2 首版
     topk_method: str = "noaux_tc"  # noaux_tc | greedy | ...
     norm_topk_prob: bool = False
+    #: MoE 分组路由（V2-Lite/V2.5/V3 的 n_group/topk_group；0 = 不分组）
+    n_group: int = 0
+    topk_group: int = 0
 
     # --- MTP（V2 无; V3 = 1 层 nextn）---
     num_nextn_predict_layers: int = 0
@@ -124,7 +127,9 @@ class ModelConfig:
             rope_theta=float(d.get("rope_theta", 10000.0)),
             tie_word_embeddings=bool(d.get("tie_word_embeddings", False)),
             num_attention_heads=int(d["num_attention_heads"]),
-            q_lora_rank=int(d.get("q_lora_rank", 0)),
+            # q_lora_rank 在真实 V2-Lite config.json 中为 null（无 q LoRA 投影，
+            # 走 q_proj 直连路径）——int(None) 会 TypeError
+            q_lora_rank=int(d.get("q_lora_rank") or 0),
             kv_lora_rank=int(d["kv_lora_rank"]),
             qk_rope_head_dim=int(d["qk_rope_head_dim"]),
             qk_nope_head_dim=int(d["qk_nope_head_dim"]),
@@ -140,6 +145,8 @@ class ModelConfig:
             scoring_func=d.get("scoring_func", "sigmoid"),
             topk_method=d.get("topk_method", "greedy"),
             norm_topk_prob=bool(d.get("norm_topk_prob", False)),
+            n_group=int(d.get("n_group") or 0),
+            topk_group=int(d.get("topk_group") or 0),
             num_nextn_predict_layers=int(d.get("num_nextn_predict_layers", 0)),
         )
         cfg.validate()
@@ -152,8 +159,13 @@ class ModelConfig:
         assert self.num_attention_heads > 0
         assert self.qk_nope_head_dim > 0 and self.qk_rope_head_dim > 0 and self.v_head_dim > 0
         assert self.kv_lora_rank > 0
-        # 我们的 KV 布局假设 latent 单流（MLA MQA 语义）
-        assert self.num_kv_heads == 1, f"MLA latent KV 要求 num_key_value_heads=1, got {self.num_kv_heads}"
+        # 我们的 KV 布局假设 latent 单流（MLA MQA 语义）。
+        # 真实 V2-Lite 的 config 把 num_key_value_heads 写成 num_attention_heads
+        # （16），但 MLA 的 KV 经 kv_a_proj_with_mqa 压缩为单流 latent——按
+        # HF 语义，MLA 下该字段应为 1；此处做归一化而不是拒绝（e2e 真实
+        # checkpoint 的 config 即如此）。
+        if self.num_kv_heads != 1 and self.kv_lora_rank > 0:
+            self.num_kv_heads = 1
         assert self.qk_rope_head_dim % 2 == 0, "rope head dim 必须为偶数"
         assert 0 <= self.first_k_dense_replace <= self.num_layers
         assert self.n_routed_experts >= 0

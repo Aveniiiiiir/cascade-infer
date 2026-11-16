@@ -139,5 +139,20 @@ class DeepseekV2ForCausalLM(nn.Module):
         if self.cfg.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
 
+    def to(self, *args, **kwargs):
+        """nn.Module.to 之外同步 rope 缓冲设备。
+
+        RotaryEmbedding 不是 nn.Module，cos/sin 缓冲不随 model.to 迁移——
+        CPU 构造后上卡（真实模型路径）时若不显式迁移，apply 的
+        cos[positions] 会因设备不匹配报错（e2e 暴露）。
+        """
+        super().to(*args, **kwargs)
+        device = kwargs.get("device", args[0] if args else None)
+        if device is not None:
+            rope = getattr(self.model, "rope", None)
+            if rope is not None and hasattr(rope, "to"):
+                rope.to(device)
+        return self
+
 
 __all__ = ["DeepseekV2DecoderLayer", "DeepseekV2Model", "DeepseekV2ForCausalLM"]
