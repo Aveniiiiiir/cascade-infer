@@ -54,7 +54,13 @@ class MoEGate(nn.Module):
         self.topk_group = cfg.topk_group
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """x [T,H] → (topk_idx [T,k], topk_weight [T,k])（fp32 权重）。"""
+        """x [T,H] → (topk_idx [T,k], topk_weight [T,k])（fp32 权重）。
+
+        数值路径注记：官方 modeling 在 softmax 打分下会把 hidden/weight
+        转成 fp32 再做 linear；实测（4080 / torch 2.7 / bf16 checkpoint）
+        bf16 矩乘 + fp32 softmax 与 HF 参考的逐 token 一致率更高
+        （638/640 vs 631/640），先按实测路径保留 bf16 矩乘。
+        """
         logits = x @ self.weight.T  # [T, E]
         if self.cfg.scoring_func == "sigmoid":
             scores = logits.float().sigmoid()
@@ -77,9 +83,12 @@ class MoEGate(nn.Module):
             scores_for_choice = scores_for_choice.view(-1, self.n_routed_experts)
         topk_idx = torch.topk(scores_for_choice, k=self.topk, dim=-1, sorted=False)[1]  # [T,k]
         topk_weight = scores.gather(1, topk_idx)  # 权重取原始 scores（无 bias）
-        if self.cfg.norm_topk_prob:
+        if self.cfg.norm_topk_prob and self.topk > 1:
+            # 官方语义：norm_topk_prob 且 top_k>1 时归一化，且**不再**乘
+            # routed_scaling_factor（与 modeling_deepseek 的 if/else 分支一致）
             topk_weight = topk_weight / topk_weight.sum(dim=-1, keepdim=True)
-        topk_weight = topk_weight * self.cfg.routed_scaling_factor
+        else:
+            topk_weight = topk_weight * self.cfg.routed_scaling_factor
         return topk_idx, topk_weight
 
 

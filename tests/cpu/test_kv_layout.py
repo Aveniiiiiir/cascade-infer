@@ -37,11 +37,14 @@ def test_total_bytes_and_shape() -> None:
 def test_derive_num_blocks() -> None:
     cfg = make_cfg(num_layers=27)
     per_block = 576 * 2 * 64 * 27  # 一个 block 全部 27 层的字节
-    # 10 GiB 预算
+    # 10 GiB 预算（按 (n+1) 个 slot 计）
     n = derive_num_blocks(10 * 2**30, cfg, 64)
-    assert n == (10 * 2**30) // per_block
-    # 不足一个 block → 至少 1
-    assert derive_num_blocks(1024, cfg, 64) == 1
+    assert n == (10 * 2**30) // per_block - 1
+    # 不足「保留行 + 1 个可用块」→ 0（调用方显式失败，而非超预算）
+    assert derive_num_blocks(1024, cfg, 64) == 0
+    # 恰好容纳 1 个可用块（2 个 slot）
+    assert derive_num_blocks(2 * per_block, cfg, 64) == 1
+    assert derive_num_blocks(2 * per_block - 1, cfg, 64) == 0
 
 
 def test_v2_lite_realistic_footprint() -> None:

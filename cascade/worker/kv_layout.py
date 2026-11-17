@@ -40,10 +40,15 @@ def derive_num_blocks(
     block_size: int,
     dtype: str = "bf16",
 ) -> int:
-    """给定可用显存预算，求可容纳的 block 数（向下取整，至少 1）。"""
+    """给定可用显存预算，求可容纳的 block 数（向下取整）。
+
+    实际张量是 (n+1) 行（行 0 保留），因此预算也要按 (n+1) 个 slot 计：
+    n = available // per_block - 1。返回 0 表示连「保留行 + 1 个可用块」
+    都放不下（调用方应显式失败，而不是静默超预算）。
+    """
     per_block_all_layers = kv_bytes_per_block(model_cfg, block_size, dtype) * model_cfg.num_layers
     assert per_block_all_layers > 0
-    return max(1, available_bytes // per_block_all_layers)
+    return max(0, available_bytes // per_block_all_layers - 1)
 
 
 def kv_shape(model_cfg: ModelConfig, num_blocks: int, block_size: int) -> tuple[int, int, int, int]:

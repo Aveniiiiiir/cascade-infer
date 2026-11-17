@@ -45,7 +45,10 @@ class CacheEngine:
         )
 
     def layer_view(self, layer_idx: int) -> torch.Tensor:
-        """第 layer_idx 层的视图: [num_blocks, block_size, kv_cache_dim]。"""
+        """第 layer_idx 层的视图: [num_blocks + 1, block_size, kv_cache_dim]。
+
+        行 0 是保留的空块（BlockManager 的 block id 为 1..num_blocks）。
+        """
         return self.kv_cache[layer_idx]
 
     # ------------------------------------------------------------------ scatter/gather
