@@ -1,5 +1,8 @@
 # Cascade 推理引擎：问题与修复报告
 
+> 后续进展：真实模型 e2e 验收见 `docs/集群验收进度-2026-11-17.md`
+> （2026-11-17 第 10 轮通过：explicit 98.75% / absorbed 98.91%，分歧全为 tie 级）。
+
 - 日期：2026-11-13
 - 仓库：`C:\Users\yuhuang.liu\projects\cascade-infer`（分支 `master` / `code-review-fixes`，HEAD `1705aed`）
 - 远端：`git@github.com:Aveniiiiiir/repo.git`（已推送 master + code-review-fixes）
