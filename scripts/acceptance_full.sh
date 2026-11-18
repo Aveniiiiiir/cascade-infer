@@ -19,14 +19,31 @@ python -m pytest tests/e2e -q
 python -m cascade.entrypoints.llm --model "$CASCADE_E2E_MODEL" \
     --prompt "The capital of France is" --prompt "def hello():" --max-tokens 16
 
-# HTTP serving 冒烟（后台起服务 → 1 条请求 → 关闭）
+# HTTP serving 冒烟（后台起服务 → 就绪探测 → 1 条请求 → 关闭）
+# 2026-11-18 修复：原 `sleep 30` 对真实模型必然失败——V2-Lite 从数据盘
+# 加载需 ~400s；且 set -e 失败路径不清理服务进程。改为就绪探测（最长
+# 600s）+ trap 兜底清理。
 python -m cascade.entrypoints.http.server --model "$CASCADE_E2E_MODEL" --port 18923 &
 SRV=$!
-sleep 30
-curl -s http://localhost:18923/v1/models | grep -q model
+cleanup() { kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null; }
+trap cleanup EXIT
+ready=0
+for _ in $(seq 1 300); do
+  if curl -s --max-time 2 http://localhost:18923/v1/models | grep -q model; then
+    ready=1; break
+  fi
+  if ! kill -0 "$SRV" 2>/dev/null; then
+    echo "HTTP server died during startup"; exit 1
+  fi
+  sleep 2
+done
+if [ "$ready" != 1 ]; then
+  echo "HTTP server not ready within 600s"; exit 1
+fi
 curl -s -X POST http://localhost:18923/v1/chat/completions \
     -H 'Content-Type: application/json' \
     -d '{"messages":[{"role":"user","content":"Hi"}],"max_tokens":8}' | grep -q chat.completion
-kill $SRV
+trap - EXIT
+cleanup
 
 echo "ACCEPTANCE FULL OK"

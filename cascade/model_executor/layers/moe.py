@@ -47,7 +47,13 @@ class MoEGate(nn.Module):
         self.weight = nn.Parameter(torch.empty((cfg.n_routed_experts, cfg.hidden_size)))
         nn.init.normal_(self.weight, std=0.02)
         if cfg.has_e_score_correction_bias:
-            self.e_score_correction_bias = nn.Parameter(torch.zeros(cfg.n_routed_experts))
+            # 2026-11-18 审计 B6：显式 fp32——构造发生在 set_default_dtype(bf16)
+            # 之下，此前 zeros(E) 得到 bf16 参数，loader 的"保持原精度"特判
+            # 变成 no-op；官方该 bias 为 fp32 且仅影响 top-k 选择，bf16 舍入
+            # 在近 tie 处可翻转专家选择
+            self.e_score_correction_bias = nn.Parameter(
+                torch.zeros(cfg.n_routed_experts, dtype=torch.float32)
+            )
         else:
             self.e_score_correction_bias = None
         self.n_group = cfg.n_group  # V2-Lite: 1（不分组语义等价）；V3: 8

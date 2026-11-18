@@ -6,27 +6,29 @@
 
 - 连续批处理（混合 varlen 批：decode + chunked prefill 同步推进）
 - 分页 KV cache + 前缀缓存（block 哈希链 + LRU + pin/unpin + COW）
-- ZOS 零开销异步调度（三段式 `Forward(N) → PostProcess(N−1) → Sample(N)`，乐观推进 + 批间 remap）
+- 同步序引擎步（schedule → prepare → forward → sample → commit；
+  ZOS 零开销异步三段式为后置增强——需 GPU 侧 token 喂数落地）
 - MTP 投机解码 + 置信度调度变长验证（采样式拒绝采样，累乘接受率 + 性能曲线定预算）
 - 批不变推理 + 确定性采样（RNG 种子 = f(seq_seed, token 绝对位置, 用途流)）
 - 结构化输出（xgrammar：regex / JSON schema / EBNF，异步编译 + 失败隔离）
-- CUDA Graph（按 total_q 分档、全档共享 memory pool）
-- MoE 专家并行 EP + EPLB（NCCL 路线）
-- FP8 权重与 KV cache
-- OpenAI 兼容 HTTP 服务 + 离线 LLM API
+- CUDA Graph（按 batch 档位分档、全档共享 memory pool；真实 V2-Lite 已验证）
+- MoE 专家并行 EP + EPLB（代码就绪，**多卡联调为后置项**；单卡路径已验收）
+- FP8 权重加载期反量化（在线 fp8 GEMM 与 FP8 KV cache 为后置项）
+- OpenAI 兼容 HTTP 服务 + 离线 LLM API（真实模型 serving 已验收）
 
 ## 支持模型
 
-- DeepSeek-V2 / V2-Lite（MLA + MoE）—— 主测试模型
-- DeepSeek-V3 / R1（MLA + MoE + nextn MTP）
+- **DeepSeek-V2 / V2-Lite**（MLA + MoE）—— 主测试模型，已全链路验收
+- DeepSeek-V3 / R1 —— **暂不支持**（`config.py` 显式拒绝：n_group 组路由 /
+  rope beta 缩放 / nextn 权重映射未实现；支持落地于 roadmap）
 
 ## 快速开始
 
 ```bash
 pip install -e ".[dev,so]"
 
-# 离线推理（需要 GPU 主机）
-python -m cascade.entrypoints.llm --model deepseek-ai/DeepSeek-V2-Lite
+# 离线推理（需要 GPU 主机 + 本地已下载的 HF 格式模型目录）
+python -m cascade.entrypoints.llm --model /path/to/DeepSeek-V2-Lite
 
 # CPU 单元测试（Windows 开发机可全跑）
 pytest tests/cpu
@@ -41,19 +43,21 @@ pytest tests/cpu            # 本机守卫，必须全绿
 scripts/gpu_smoke.sh        # 集群冒烟
 ```
 
-## 验收状态（2026-11-17）
+## 验收状态（2026-11-18）
 
-集群 e2e（RTX 4080 SUPER 32GB，DeepSeek-V2-Lite 对拍 HF 官方 modeling）：
+集群（RTX 4080 SUPER 32GB，DeepSeek-V2-Lite 对拍 HF 官方 modeling）：
 
 | 判据 | 结果 |
 |---|---|
 | teacher-forcing explicit | **632/640 = 98.75%** 逐位置 argmax 一致 |
 | teacher-forcing absorbed（MLA absorbed decode） | **633/640 = 98.91%** |
 | free-running 混合批 | 首分歧均位于 HF margin ≤ 0.125 的 tie 级位置 |
+| 分层测试 `tests/{model,triton_ops,engine}` | 43 / 51 / 16 passed |
+| 真实模型 CUDA Graph | 通过（tiers [1,2]、num_splits=8、并发出词正常） |
+| 真实模型 HTTP serving | 通过（/v1/models + chat 200） |
 
 - 分歧全部为 bf16 tie 级数值噪声，非系统性错误；验收以 teacher-forcing 一致率
   与 margin 检查为准（bf16 下 free-running 不保证 token-exact）。
-- 非 e2e 全量测试（3080 Ti / 4080）：`tests/{cpu,model,triton_ops,engine}` 全绿。
 - 性能基线（3080 Ti，生产形状）：decode 381 GB/s（8.1e4 tok/s）、
   prefill 2.25e6 tok/s、fused_moe 18.5 TFLOPS。
 

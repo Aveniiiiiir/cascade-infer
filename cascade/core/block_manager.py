@@ -26,12 +26,22 @@ class BlockAllocationError(RuntimeError):
 
 
 class BlockManager:
-    __slots__ = ("num_blocks", "_ref_counts", "_cache_owned", "_free_blocks", "_num_allocated_high_water")
+    """2026-11-18 审计 #5：`reserved` = 引擎自留块数（CUDA graph 的
+    scratch 块）。容量守卫（调度器 NEVER-fit / add_request 池校验）必须用
+    `capacity` 而非 `num_blocks`——否则 scratch 对调度器不可见，池被高估
+    1 块：足迹恰为满池的请求 `_acquire_kv` 永远失败且 NEVER 判定不触发
+    → 活锁空转、离线 generate 死循环。
+    """
 
-    def __init__(self, num_blocks: int) -> None:
+    __slots__ = ("num_blocks", "reserved", "_ref_counts", "_cache_owned", "_free_blocks", "_num_allocated_high_water")
+
+    def __init__(self, num_blocks: int, reserved: int = 0) -> None:
         if num_blocks < 1:
             raise ValueError(f"num_blocks must be >= 1, got {num_blocks}")
-        self.num_blocks = num_blocks
+        if not (0 <= reserved < num_blocks):
+            raise ValueError(f"reserved must be in [0, num_blocks), got {reserved}/{num_blocks}")
+        self.num_blocks = num_blocks  # 物理 id 上界（合法 id 1..num_blocks）
+        self.reserved = reserved
         # 下标 0 保留为空块；可用块 id 为 1..num_blocks
         self._ref_counts = [0] * (num_blocks + 1)
         self._cache_owned = [False] * (num_blocks + 1)
@@ -48,7 +58,7 @@ class BlockManager:
         assert self._ref_counts[block_id] == 0 and not self._cache_owned[block_id]
         self._ref_counts[block_id] = 1
         self._num_allocated_high_water = max(
-            self._num_allocated_high_water, self.num_blocks - len(self._free_blocks)
+            self._num_allocated_high_water, self.num_blocks - self.reserved - len(self._free_blocks)
         )
         return block_id
 
@@ -106,12 +116,18 @@ class BlockManager:
     # ------------------------------------------------------------------ stats
 
     @property
+    def capacity(self) -> int:
+        """可分配给请求的块数（物理块数 − 引擎自留）。调度器容量守卫一律
+        用本值，不得直接读 num_blocks（审计 #5）。"""
+        return self.num_blocks - self.reserved
+
+    @property
     def num_free_blocks(self) -> int:
         return len(self._free_blocks)
 
     @property
     def num_allocated_blocks(self) -> int:
-        return self.num_blocks - len(self._free_blocks)
+        return self.num_blocks - self.reserved - len(self._free_blocks)
 
     @property
     def num_evictable_blocks(self) -> int:

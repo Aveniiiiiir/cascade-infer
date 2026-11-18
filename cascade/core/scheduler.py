@@ -137,12 +137,17 @@ class Scheduler:
         seq = Sequence(request_id, prompt_token_ids, sampling_params.snapshot(), has_so=has_so)
         # 上限校验：即使无任何前缀命中，prompt 也必须放得进 KV 池
         min_blocks = seq.num_blocks_for(len(prompt_token_ids), self.block_size)
-        if min_blocks > self.block_mgr.num_blocks:
+        if min_blocks > self.block_mgr.capacity:
             raise ValueError(
                 f"request {request_id}: prompt of {len(prompt_token_ids)} tokens needs "
-                f"{min_blocks} blocks but the pool has {self.block_mgr.num_blocks}"
+                f"{min_blocks} blocks but the pool has {self.block_mgr.capacity} allocatable"
             )
-        if seq.num_tokens + 1 > self.cfg.runtime_max_model_len:
+        # 2026-11-18 审计 #1 修复：守卫此前用 runtime_max_model_len（含投机
+        # 余量 K），prompt 落在 [max_model_len, runtime) 时入队成功、prefill
+        # 完成后 _truncate_new_tokens 的 allowed=0 → assert 崩溃 →
+        # fail_all_inflight 判死全部在途请求。必须按 max_model_len 校验
+        # （+1 为首 token 留位：num_tokens ≤ max-1 ⇒ allowed ≥ 1 恒成立）。
+        if seq.num_tokens + 1 > self.cfg.model.max_model_len:
             raise ValueError(
                 f"request {request_id}: prompt longer than max_model_len={self.cfg.model.max_model_len}"
             )
@@ -195,13 +200,25 @@ class Scheduler:
                 if not seq.is_finished and seq.request_id not in self._preempted_this_step
             ][: max_seqs]
             K = self.cfg.scheduler.nextn_draft_tokens
-            rates = {s.request_id: self._mtp_rates.get(s.request_id, [0.0] * K) for s in candidates}
+            # 2026-11-18：未知 rid 的先验 = 乐观 [1.0]*K（冷启动全验证，
+            # 与固定 K 等价）——此后按 _verify_mtp_seq 回灌的实测率收敛。
+            # 若默认 0.0 会死锁：v=1 → 无草案验证 → 永不回灌 → v 恒 1。
+            rates = {
+                s.request_id: self._mtp_rates.get(s.request_id, [1.0] * K)
+                for s in candidates
+            }
             varlen_plan = self._mtp_varlen.plan(rates, min(budget, max(1, len(candidates) * (1 + K))))
         for seq in sorted(self.running, key=lambda s: s.num_output_tokens):
             if len(out.scheduled) >= max_seqs or budget <= 0:
                 break
             if seq.is_finished or seq.request_id in self._preempted_this_step:
                 continue  # 排序副本中的已抢占/已结束 seq
+            # 2026-11-18 审计 #1 补充：恰好填满 max_model_len 且未触发截断
+            # 标志的 seq（allowed 恰好用尽时循环不置 finish）——显式封顶，
+            # 否则下一步 allowed=0 → assert 崩溃
+            if seq.num_tokens >= self.cfg.model.max_model_len:
+                self._finish_sequence(seq, SequenceStatus.FINISHED_LENGTH_CAPPED)
+                continue
             # MTP：decode 行 = 1 fresh + K 验证行（乐观推进；提交时回滚未接受部分）
             if varlen_plan is not None and seq.request_id in varlen_plan:
                 num_new = varlen_plan[seq.request_id]
@@ -211,7 +228,7 @@ class Scheduler:
             if not ok:
                 # 永不满足：自身足迹已超池（自抢占排除自身 → 无候选可抢）。
                 # DeepInfer NEVER 路径：判 FINISHED_IGNORED 而非活锁空转。
-                if seq.num_blocks_for(seq.num_tokens + num_new - 1, self.block_size) > self.block_mgr.num_blocks:
+                if seq.num_blocks_for(seq.num_tokens + num_new - 1, self.block_size) > self.block_mgr.capacity:
                     _log.warning(
                         "request %s: KV footprint exceeds pool → FINISHED_IGNORED",
                         seq.request_id,
@@ -255,7 +272,7 @@ class Scheduler:
             ok = self._acquire_kv(seq, num_new_tokens=chunk, out=out)
             if not ok:
                 # 永不满足：重算后的完整足迹超池（prompt 之外还要装回已生成输出）
-                if seq.num_blocks_for(seq.num_tokens, self.block_size) > self.block_mgr.num_blocks:
+                if seq.num_blocks_for(seq.num_tokens, self.block_size) > self.block_mgr.capacity:
                     self._rollback_match(seq, out)
                     _log.warning(
                         "request %s: recompute footprint exceeds pool → FINISHED_IGNORED",

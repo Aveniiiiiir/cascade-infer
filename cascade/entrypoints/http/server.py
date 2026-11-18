@@ -60,13 +60,25 @@ def _bad_request(msg: str) -> JSONResponse:
 
 
 class AsyncEngine:
-    """LLMEngine 的异步门面：后台线程跑引擎循环，请求经队列注入。"""
+    """LLMEngine 的异步门面：后台线程跑引擎循环，请求经队列注入。
+
+    2026-11-18 审计 #2/#4 修复：
+    - **abort 串行化**：此前从 asyncio 线程直接调 scheduler.abort，与引擎
+      线程的 step 并发——Sequence/block_table 竞态可致崩溃（断言炸 →
+      fail_all_inflight 全批陪葬）或块双重释放 → 跨请求静默 KV 串写。
+      现改为 abort 队列，由引擎线程在每轮 step 前 drain 执行。
+    - **活跃 rid 集合**：消费方退出（断连/超时清理）后 _put 直接丢弃
+      迟到输出并止损——旧 setdefault 会复活死键，条目随每步 append
+      无界增长（每条 RequestOutput 携带全量输出拷贝）。
+    """
 
     def __init__(self, llm: LLM) -> None:
         self.llm = llm
         self._engine = llm._engine
         self._queue: queue.Queue[tuple[str, list[int], SamplingParams]] = queue.Queue()
+        self._abort_queue: queue.Queue[str] = queue.Queue()
         self._lock = threading.Lock()
+        self._active: set[str] = set()  # 消费方仍在消费的 rid
         self._buffers: dict[str, list] = {}  # rid → [RequestOutput]
         self._finished: dict[str, str] = {}  # rid → finish_reason
         self._stop = threading.Event()
@@ -76,7 +88,20 @@ class AsyncEngine:
     # ------------------------------------------------------------------ engine loop
 
     def _engine_loop(self) -> None:
+        from cascade.engine.llm_engine import EngineStepError
+
         while not self._stop.is_set():
+            # 0. abort 串行化（审计 #2：与 add_request 同一模式——引擎线程
+            #    是调度器状态的唯一变更者）
+            while True:
+                try:
+                    rid = self._abort_queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    self._engine.abort(rid)
+                except Exception:
+                    _log.exception("abort %s failed", rid)
             # 1. 收编新请求（审查 #4：add_request 异常只判死该请求，不杀线程）
             drained = False
             try:
@@ -101,42 +126,69 @@ class AsyncEngine:
                 continue
             try:
                 outputs = self._engine.step()
+            except EngineStepError as ese:
+                # 审计 #3：引擎层已复位 pending 并携带判死回执——必须 _put
+                # 它们，否则在途客户端各自挂满 600s 超时
+                _log.exception("engine step failed; failing all in-flight requests")
+                outputs = list(ese.receipts)
             except Exception:
-                # 审查 #4：异常步之后 pending 永不提交 → schedule 的深度断言
-                # 会把循环锁进 100% CPU 忙转。fail_all_inflight 判死全部在途
-                # 请求并复位 pending，引擎继续服务新请求。
                 _log.exception("engine step failed; failing all in-flight requests")
                 outputs = self._engine.scheduler.fail_all_inflight()
             for ro in outputs:
                 self._put(ro)
+            # 审计 #10：SO 编译 pending（最长 30s）且本步无产出 → 免 CPU 空转
+            if not outputs and self._engine._so_builder.num_pending > 0:
+                time.sleep(0.001)
         # 收尾冲刷（判死回执；同步序下无在途采样滞后）
         for ro in self._engine.scheduler.flush_final_outputs():
             self._put(ro)
 
     def _put(self, ro) -> None:
         with self._lock:
-            self._buffers.setdefault(ro.request_id, []).append(ro)
-            if ro.finish_reason is not None:
-                self._finished[ro.request_id] = ro.finish_reason
+            alive = ro.request_id in self._active
+            if alive:
+                self._buffers.setdefault(ro.request_id, []).append(ro)
+                if ro.finish_reason is not None:
+                    self._finished[ro.request_id] = ro.finish_reason
+        if not alive:
+            # 审计 #4：消费方已退出（断连/超时清理后）的迟到输出——丢弃并
+            # 止损。_put 在引擎线程执行，直接 abort 无跨线程竞态。
+            try:
+                self._engine.abort(ro.request_id)
+            except Exception:
+                _log.exception("late-output abort %s failed", ro.request_id)
 
     # ------------------------------------------------------------------ public
 
     def submit(self, prompt_ids: list[int], params: SamplingParams) -> str:
         rid = f"chat-{uuid.uuid4().hex[:12]}"
         with self._lock:
+            self._active.add(rid)
             self._buffers[rid] = []
         self._queue.put((rid, prompt_ids, params))
         return rid
 
     def abort(self, rid: str) -> bool:
-        return self._engine.abort(rid)
+        """投递到引擎线程串行执行（审计 #2——跨线程直调会与 step 竞态）。
+
+        返回值 = 是否为已知活跃请求（异步执行，不等待结果）。
+        """
+        with self._lock:
+            known = rid in self._active
+        if known:
+            self._abort_queue.put(rid)
+        return known
 
     def iter_outputs(self, rid: str, timeout_s: float = _REQUEST_TIMEOUT_S) -> AsyncGenerator:
         """轮询式流式产出（v1 线程→asyncio 桥接）。
 
-        审查 #6：生成器退出（finish/断连/超时）时清理 _buffers/_finished 的
-        rid 键——否则键随请求数无界累积；超时触发 abort 让引擎停止为该
-        请求继续算 KV。
+        审查 #6：生成器退出（finish/断连/超时）时清理 _buffers/_finished/
+        _active 的 rid 键——否则键随请求数无界累积；超时触发 abort 让引擎
+        停止为该请求继续算 KV。
+
+        2026-11-18 审计 #4 补充：非正常退出（断连，未见到 finish）时投递
+        abort 止损——断连不取消引擎侧计算，否则引擎会为死连接白算到
+        max_tokens 且迟到输出持续复活死键。
         """
 
         async def gen() -> AsyncGenerator:
@@ -159,7 +211,11 @@ class AsyncEngine:
             finally:
                 with self._lock:
                     self._buffers.pop(rid, None)
-                    self._finished.pop(rid, None)
+                    finished = self._finished.pop(rid, None) is not None
+                    self._active.discard(rid)
+                if not finished:
+                    # 消费方退出且请求未完成（断连/消费异常）→ 止损
+                    self._abort_queue.put(rid)
 
         return gen()
 
@@ -220,12 +276,16 @@ def _stop_token_seqs(llm: LLM, stop: list[str] | None) -> list[tuple[int, ...]] 
 
 
 def _validate_prompt(llm: LLM, ids: list[int]) -> JSONResponse | None:
-    """审查 #4：空/超长 prompt 在 handler 层拒绝，不进引擎线程。"""
+    """审查 #4：空/超长 prompt 在 handler 层拒绝，不进引擎线程。
+
+    2026-11-18 审计 #1 配套：`>=`——长度恰等于 max_model_len 的 prompt
+    没有为任何生成 token 留位（引擎入队守卫同样会拒），此处先行 400。
+    """
     if not ids:
         return _bad_request("prompt tokenize 后为空（messages 内容为空）")
     max_len = llm._engine.cfg.model.max_model_len
-    if len(ids) > max_len:
-        return _bad_request(f"prompt {len(ids)} tokens 超过 max_model_len={max_len}")
+    if len(ids) >= max_len:
+        return _bad_request(f"prompt {len(ids)} tokens 达到 max_model_len={max_len}（无生成空间）")
     return None
 
 
@@ -262,7 +322,10 @@ def create_app(llm: LLM, api_key: str | None = None) -> FastAPI:
                 temperature=req.temperature,
                 top_p=req.top_p,
                 max_tokens=req.max_tokens or 256,
-                seq_seed=req.seed if req.seed is not None else 0,
+                # 2026-11-18 审计 #9：无 seed 的请求走 SamplingParams 的
+                # 每请求随机默认——服务层强制 0 会使同 prompt 跨请求输出
+                # 逐位相同（可复现性侧信道 + 多样性归零）
+                seq_seed=req.seed,
                 stop_token_ids=(llm.eos_token_id,),
                 stop_token_seqs=stop_seqs,
                 so_args=_so_args_from_request(req),
@@ -344,7 +407,10 @@ def create_app(llm: LLM, api_key: str | None = None) -> FastAPI:
                 temperature=req.temperature,
                 top_p=req.top_p,
                 max_tokens=req.max_tokens or 256,
-                seq_seed=req.seed if req.seed is not None else 0,
+                # 2026-11-18 审计 #9：无 seed 的请求走 SamplingParams 的
+                # 每请求随机默认——服务层强制 0 会使同 prompt 跨请求输出
+                # 逐位相同（可复现性侧信道 + 多样性归零）
+                seq_seed=req.seed,
                 stop_token_ids=(llm.eos_token_id,),
             )
         except ValueError as e:

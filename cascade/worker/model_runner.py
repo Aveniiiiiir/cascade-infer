@@ -84,7 +84,7 @@ class ModelRunner:
     __slots__ = (
         "engine_cfg", "model", "cfg", "cache", "device", "dtype", "use_absorbed",
         "sampler", "draft_model", "calibrator",
-        "_mtp_drafts", "_so_matchers", "_so_failed",
+        "_mtp_drafts", "_mtp_accept_feed", "_so_matchers", "_so_failed",
     )
 
     def __init__(
@@ -111,6 +111,9 @@ class ModelRunner:
         #: MTP：草案模型（DraftModel 协议）与上一轮草案状态
         self.draft_model = draft_model
         self._mtp_drafts: dict[str, "DraftInfo"] = {}
+        #: 2026-11-18 审计 #6(a)：MTP 接受率回灌缓冲（引擎 step 消费 →
+        #: scheduler.update_mtp_accept → varlen 逐 seq 验证长度的数据源）
+        self._mtp_accept_feed: dict[str, list[float]] = {}
         self.calibrator = ConfidenceCalibrator()
         #: SO：matcher 句柄 + 本步失败集合（失败隔离）
         self._so_matchers: dict[str, "SOMatcher"] = {}
@@ -175,7 +178,15 @@ class ModelRunner:
                 first = seq.token_at(start)
                 if s.num_new_tokens > 1:
                     draft = self._mtp_drafts.get(seq.request_id)
-                    rest = list(draft.tokens) if draft else [0] * (s.num_new_tokens - 1)
+                    if draft is not None:
+                        # 2026-11-18 审计 #6(c)：varlen 的验证长度 v ∈ (1, 1+K]
+                        # ——草案按 K 发射，必须截断到 num_new_tokens−1，
+                        # 否则 input_ids 与 positions/seq_ids 形状失配
+                        # （吸收路径 assert 崩 / 显式路径广播错位）
+                        rest = list(draft.tokens)[: s.num_new_tokens - 1]
+                        rest += [0] * (s.num_new_tokens - 1 - len(rest))
+                    else:
+                        rest = [0] * (s.num_new_tokens - 1)
                 else:
                     rest = []
                 toks = [first, *rest]
@@ -279,13 +290,26 @@ class ModelRunner:
         return (self.cfg.vocab_size + 31) // 32
 
     def accept_so_committed(self, request_id: str, tokens: list[int]) -> None:
-        """post_process 时推进 matcher 真实状态（MTP/普通行统一入口）。"""
+        """post_process 时推进 matcher 真实状态（MTP/普通行统一入口）。
+
+        2026-11-18 审计 B2：检查 accept_token 返回值——False = 已提交
+        token 语法非法且状态未推进（掩码门控采样下不应发生，但截断/停机
+        边界可能引入）。显式判 failed 而非静默 desync（旧代码会卡住后续
+        所有掩码在错误位置）。
+        """
         m = self._so_matchers.get(request_id)
         if m is None or m.status == -1:
             return
         try:
             for t in tokens:
-                m.accept_token(int(t))
+                if not m.accept_token(int(t)):
+                    _log.warning(
+                        "SO %s: committed token %d rejected by grammar → so_failed",
+                        request_id, int(t),
+                    )
+                    self._so_failed.add(request_id)
+                    m.status = -1
+                    return
             m.status = 2
         except Exception:
             self._so_failed.add(request_id)
@@ -415,10 +439,14 @@ class ModelRunner:
         draft = self._mtp_drafts.pop(seq.request_id, None)
         P = seq.num_tokens - 1  # 输入首行（已提交末 token）的绝对位置
         dev = logits.device
-        if draft is not None and len(draft.tokens) == K_actual and K_actual > 0:
-            d_tokens = torch.tensor(draft.tokens, dtype=torch.int64, device=dev)
-            d_lp = draft.logprobs
-            d_list = list(draft.tokens)
+        if draft is not None and K_actual > 0 and len(draft.tokens) >= K_actual:
+            # 2026-11-18 审计 #6(d)：varlen 的 v ∈ (1, 1+K] 时草案按前缀
+            # 截断到 K_actual——旧代码要求 len == K_actual 精确相等，
+            # varlen 接通后前缀草案被整体丢弃（fresh 强拒 → 每步只提交
+            # 1 token，MTP 零收益）
+            d_list = list(draft.tokens[:K_actual])
+            d_tokens = torch.tensor(d_list, dtype=torch.int64, device=dev)
+            d_lp = draft.logprobs[:K_actual]
         else:
             d_tokens = torch.full((K_actual,), -1, dtype=torch.int64, device=dev)
             d_lp = torch.zeros(K_actual, logits.shape[-1], dtype=torch.float32, device=dev)
@@ -429,12 +457,32 @@ class ModelRunner:
             try:
                 words = self._so_words
                 masks = [[0] * words for _ in range(s.num_new_tokens)]
-                for j in range(K_actual):
-                    self._fill_mask_row(matcher, masks[j])
-                    matcher.accept_token(d_list[j] if d_list is not None else 0)
-                if K_actual > 0:
-                    self._fill_mask_row(matcher, masks[K_actual])  # bonus 行（全接受态）
-                    matcher.rollback(K_actual)
+                # 2026-11-18 审计 B1/B2 修复：
+                # - 行 0（当前语法状态）任何情况都必须填充——K_actual==0
+                #   （varlen v=1）时它是唯一行；全零掩码 → 全 -inf →
+                #   softmax NaN → _inv_cdf「全零概率行」ValueError →
+                #   引擎级 fail_all_inflight（varlen+SO 必触发）。
+                # - accept_token 返回 False = 非法且状态未推进：停止试探
+                #   （后续草案行在 j 处必然被目标分布拒绝——掩码沿用行 j），
+                #   rollback 只按实际推进数回滚——回滚超过实际接受步数
+                #   xgrammar 会抛 RuntimeError（旧代码按固定 K 回滚：
+                #   fresh 行/首个草案非法时 SO+MTP 第一个 decode 步必炸）。
+                # - fresh 行（无草案）不试探推进状态；行 1.. 不会被
+                #   mtp_verify 读取（哨兵在 j=0 强制拒绝即返回）。
+                self._fill_mask_row(matcher, masks[0])
+                if K_actual > 0 and d_list is not None:
+                    accepted_probe = 0
+                    for j in range(K_actual):
+                        if not matcher.accept_token(d_list[j]):
+                            for jj in range(j + 1, s.num_new_tokens):
+                                masks[jj] = list(masks[j])
+                            break
+                        accepted_probe += 1
+                        if j + 1 < K_actual:
+                            self._fill_mask_row(matcher, masks[j + 1])
+                    else:
+                        self._fill_mask_row(matcher, masks[K_actual])  # bonus 行（全接受态）
+                    matcher.rollback(accepted_probe)
                 bitmask = torch.tensor(masks, dtype=torch.int32, device=dev)
                 row_map = torch.arange(s.num_new_tokens, dtype=torch.int32, device=dev)
                 apply_token_bitmask(rows, bitmask, row_map)  # log_softmax 之前
@@ -460,6 +508,11 @@ class ModelRunner:
             request_ids=[seq.request_id] * n_rows,
         )
         probs = self.sampler._transform(rows.clone(), sr)  # [n_rows, V] 概率
+        # 2026-11-18 审计 B5：top-p/top-k 截断后行和 Z<1——接受比与残差按
+        # 未归一 q 计算会系统性偏离目标分布（同 seed 下 MTP 开/关产出
+        # 不同分布，违反投机解码的分布保持）。归一化后再取 log；
+        # log(0)=-inf 契约保留（零概率列永不命中）。
+        probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-38)
         # log(0) = -inf（合法：exp(-inf)=0，零概率列永不命中——与普通采样
         # 的逆 CDF 契约一致；clamp 会把零概率列变成非零，破坏该契约）
         lp = probs.log()
@@ -472,10 +525,19 @@ class ModelRunner:
             dtype=torch.float32,
         )
         res = mtp_verify(lp, d_lp, d_tokens, accept_u, sample_u)
-        # 置信度校准闭环（draft p_top1 ↔ 真实接受概率估计）
-        if draft is not None:
+        # 置信度校准 + varlen 接受率回灌（2026-11-18 审计 #6(a)/(e)）：
+        # 仅真实草案行——fresh/哨兵行的 accept_probs 恒 [1.0]，回灌会把
+        # rates 抬到虚高（varlen 计划系统性乐观）、污染校准器 EMA。
+        if d_list is not None:
+            self._mtp_accept_feed[seq.request_id] = list(res.accept_probs)
             self.calibrator.update_batch(draft.p_top1[: len(res.accept_probs)], res.accept_probs)
         return res.committed
+
+    def drain_mtp_accept_feed(self) -> list[tuple[str, list[float]]]:
+        """引擎 step 消费的接受率回灌（→ scheduler.update_mtp_accept）。"""
+        items = list(self._mtp_accept_feed.items())
+        self._mtp_accept_feed.clear()
+        return items
 
     def _launch_drafts(self, sched_out, mtp_tokens: dict[str, list[int]]) -> None:
         """为下一步发射草案：输入 = 本步提交的末 token（同步验证模式下

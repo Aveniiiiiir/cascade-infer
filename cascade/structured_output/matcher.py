@@ -32,7 +32,7 @@ class GrammarBackend:
     def fill_mask_into(self, words: Sequence[int], vocab_size: int) -> None:
         raise NotImplementedError
 
-    def accept_token(self, token_id: int) -> None:
+    def accept_token(self, token_id: int) -> bool:
         raise NotImplementedError
 
     def rollback(self, k: int) -> None:
@@ -73,8 +73,11 @@ class XGrammarBackend(GrammarBackend):
         for i in range(len(words)):
             words[i] = int(w[i])
 
-    def accept_token(self, token_id: int) -> None:
-        self.matcher.accept_token(token_id)
+    def accept_token(self, token_id: int) -> bool:
+        """2026-11-18 审计 B2：返回 xgrammar 的接受结果——False = token
+        非法且**状态未推进**（xgrammar 0.2.9 契约，官方文档要求调用方处理
+        返回值）。MTP 验证的试探循环依赖它决定回滚步数。"""
+        return bool(self.matcher.accept_token(token_id))
 
     def rollback(self, k: int) -> None:
         self.matcher.rollback(k)
@@ -107,8 +110,9 @@ class StubGrammarBackend(GrammarBackend):
             return
         words[tok // 32] |= 1 << (tok % 32)
 
-    def accept_token(self, token_id: int) -> None:
+    def accept_token(self, token_id: int) -> bool:
         self._step += 1  # 宽松接受（约束由掩码施加；接受只推进状态）
+        return True
 
     def rollback(self, k: int) -> None:
         self._step = max(0, self._step - k)
@@ -135,8 +139,8 @@ class SOMatcher:
         """下一步合法 token 位掩码 → 写入 words（长度 num_words）。"""
         self.backend.fill_mask_into(words, self.vocab_size)
 
-    def accept_token(self, token_id: int) -> None:
-        self.backend.accept_token(token_id)
+    def accept_token(self, token_id: int) -> bool:
+        return self.backend.accept_token(token_id)
 
     def rollback(self, k: int) -> None:
         self.backend.rollback(k)

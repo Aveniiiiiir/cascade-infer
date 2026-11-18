@@ -236,6 +236,12 @@ class SchedulerConfig:
         assert self.nextn_draft_tokens >= 0
         if self.mtp_varlen:
             assert self.nextn_draft_tokens > 0, "varlen 需要 MTP 开启"
+            # 2026-11-18 审计 #6(f)：MtpVarlen.plan 断言 budget ≥ len(rates)
+            # ——逐行预算至少 1 token/seq，否则首个 decode 步直接崩溃
+            assert self.max_num_batched_tokens >= self.max_num_seqs, (
+                f"mtp_varlen 需要 max_num_batched_tokens ({self.max_num_batched_tokens}) "
+                f">= max_num_seqs ({self.max_num_seqs})"
+            )
             from cascade.common.env import envs
 
             assert not envs.BATCH_INVARIANT, "varlen 与批不变互斥（DeepInfer 同此）"

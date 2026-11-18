@@ -34,7 +34,7 @@ serve = ["fastapi>=0.115", "uvicorn>=0.30", "sse-starlette>=2.0"]
 dev = ["pytest>=8.0", "pytest-timeout>=2.3", "ruff>=0.8"]
 
 [project.urls]
-Repository = "https://example.invalid/cascade-infer"
+Repository = "https://github.com/Aveniiiiiir/cascade-infer"
 
 [tool.setuptools.packages.find]
 include = ["cascade", "cascade.*"]

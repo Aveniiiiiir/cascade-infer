@@ -49,6 +49,11 @@ class LLM:
             scheduler=SchedulerConfig(
                 max_num_seqs=max_num_seqs,
                 max_num_batched_tokens=max_num_batched_tokens,
+                # 审查 #8 交叉校验要求 sum-K 预算 ≥ max_model_len；真实
+                # V2-Lite 的 max_position_embeddings=163840 > 默认 32768，
+                # 未对齐时 LLMEngine.validate()（2026-11-18 起无条件执行）
+                # 会直接拒载。单个 prompt 必须能过预算是设计语义。
+                prefill_sum_seqlen_k=max(SchedulerConfig.prefill_sum_seqlen_k, model_cfg.max_model_len),
                 enable_prefix_caching=enable_prefix_caching,
             ),
         )

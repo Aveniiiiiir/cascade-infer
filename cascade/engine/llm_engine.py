@@ -18,6 +18,8 @@ MTP 的乐观推进/提交回滚协议不变（scheduler._commit_optimistic_adva
 
 from __future__ import annotations
 
+import time
+
 from cascade.common.logger import get_logger
 from cascade.config import EngineConfig
 from cascade.core.block_manager import BlockManager
@@ -29,6 +31,22 @@ from cascade.structured_output.builder import SOMatchersBuilder
 from cascade.worker.model_runner import ModelRunner
 
 _log = get_logger("engine.llm_engine")
+
+
+class EngineStepError(RuntimeError):
+    """引擎步异常（2026-11-18 审计 #3）：携带 fail_all_inflight 的判死回执。
+
+    引擎层 except 先复位 pending（防深度断言锁死）再以本异常重抛；服务层
+    必须 `for ro in exc.receipts: _put(ro)`——否则在途客户端收不到判死
+    回执，各自挂满 600s 超时（此前回执被丢弃 + 服务层二次调用时 pending
+    已空 → 返回 []）。
+    """
+
+    __slots__ = ("receipts",)
+
+    def __init__(self, receipts: list[RequestOutput]) -> None:
+        super().__init__("engine step failed; all in-flight requests failed")
+        self.receipts = receipts
 
 
 class LLMEngine:
@@ -61,7 +79,17 @@ class LLMEngine:
             # 注意：这里变异调用方传入的 engine_cfg（共享对象）——引擎构造后
             # cfg 即引擎所有，调用方不应复用（审查 #23 注记）。
             engine_cfg.scheduler.nextn_draft_tokens = envs.NEXTN_DECODE
-            engine_cfg.validate()  # 重算 runtime_max_model_len（K 计入位置余量）
+        if draft_model is not None and envs.ENABLE_MTP_VARLEN and not engine_cfg.scheduler.mtp_varlen:
+            # 2026-11-18 审计 #6(b)：ENABLE_MTP_VARLEN 此前定义后从未被读取
+            # （死环境变量）——接线到 SchedulerConfig（validate 会交叉校验
+            # nextn>0 与 BATCH_INVARIANT 互斥）。
+            engine_cfg.scheduler.mtp_varlen = True
+        # validate 必须无条件执行（2026-11-18 HTTP 冒烟暴露）：此前仅 draft
+        # 路径调用，纯 LLM 主路径 runtime_max_model_len 恒为默认 0 →
+        # _profile_num_blocks 的 max_useful = 1（KV 池被 cap 到 1 块，
+        # 并发尽毁）、rope 预热仅 1024 位置（>1024 的 eager 前向越界）、
+        # graph block 表仅 2 列。validate 同时重算 K 计入的位置余量。
+        engine_cfg.validate()
         self.cfg = engine_cfg
         self.runner = ModelRunner(
             engine_cfg, model_dir, device=device, dtype=dtype, num_blocks=num_blocks,
@@ -106,8 +134,12 @@ class LLMEngine:
             return None
         from cascade.worker.cuda_graph_runner import CudaGraphRunner
 
-        # 预留 scratch 块（分配即持有；图 padding 行的 KV 写入目标）
+        # 预留 scratch 块（分配即持有；图 padding 行的 KV 写入目标）。
+        # 2026-11-18 审计 #5：scratch 必须计入 reserved——调度器容量守卫
+        # 用 capacity（= num_blocks − reserved），否则池被高估 1 块，
+        # 恰好满池的请求活锁空转。
         scratch = self.block_mgr.allocate()
+        self.block_mgr.reserved = 1
         try:
             return CudaGraphRunner(
                 self.runner.model, self.runner.cache, engine_cfg, device,
@@ -116,6 +148,7 @@ class LLMEngine:
             )
         except Exception:  # 图捕获失败（显存/驱动限制）→ 优雅降级 eager
             self.block_mgr.release(scratch)
+            self.block_mgr.reserved = 0
             _log.warning("CUDA graph capture failed → fallback to eager", exc_info=True)
             return None
 
@@ -147,7 +180,14 @@ class LLMEngine:
 
     def abort(self, request_id: str) -> bool:
         """审查 #11：serving 层（AsyncEngine.abort）依赖此入口——此前缺失，
-        一调用即 AttributeError。"""
+        一调用即 AttributeError。
+
+        2026-11-18 审计 #8：先弹出 SO staging——编译中（最长 30s）的请求
+        不在调度器任何队列里，不 pop 则 abort 返回 False 且请求编译完成后
+        照常完整生成；builder 迟到结果由 _pump_so 的 `staged is None`
+        分支丢弃。
+        """
+        self._so_staging.pop(request_id, None)
         return self.scheduler.abort(request_id)
 
     def has_unfinished_requests(self) -> bool:
@@ -178,13 +218,18 @@ class LLMEngine:
         try:
             launch = self.runner.launch_sample(logits, sched_out, batch)
             sampled = launch.wait_tokens() if launch is not None else {}
-        except Exception:
+        except Exception as exc:
             # 采样/验证异常：必须弹出本步 pending（否则下一步 schedule 的
-            # 深度断言会把引擎锁死）。判死全部在途请求后重抛——引擎线程
-            # 的 fail_all_inflight 兜底在服务层，引擎层先复位 pending。
-            self.scheduler.fail_all_inflight()
-            raise
+            # 深度断言会把引擎锁死）。判死全部在途请求，回执随
+            # EngineStepError 带给服务层（审计 #3：丢弃回执 = 客户端挂死
+            # 到 600s 超时）。
+            raise EngineStepError(self.scheduler.fail_all_inflight()) from exc
         outputs.extend(self.scheduler.update_from_output(sampled))
+        # 2026-11-18 审计 #6(a)：回灌 MTP 接受率——varlen 调度（逐 seq
+        # 验证长度）的唯一数据源。此前生产链路从不调用 update_mtp_accept，
+        # rates 恒 0 → varlen 模式 MTP 完全退化（草案照算、永不验证）。
+        for rid, accept_probs in self.runner.drain_mtp_accept_feed():
+            self.scheduler.update_mtp_accept(rid, accept_probs)
         # SO：统一推进 matcher 真实状态（MTP/普通行）；结束的 seq 卸载
         for ro in outputs:
             if ro.new_token_ids:
@@ -287,10 +332,15 @@ class LLMEngine:
         results: dict[str, list[int]] = {i: [] for i in ids}
         finish: dict[str, str] = {}
         while self.scheduler.has_unfinished_requests or self._so_staging:
-            for ro in self.step():
+            stepped = self.step()
+            for ro in stepped:
                 results[ro.request_id].extend(ro.new_token_ids)
                 if ro.finish_reason is not None:
                     finish[ro.request_id] = ro.finish_reason
+            # 2026-11-18 审计 #10：SO 编译 pending（最长 30s）且无活可调时
+            # 免 CPU 全速空转
+            if not stepped and self._so_builder.num_pending > 0:
+                time.sleep(0.001)
         # 同步序无一步滞后；但判死请求的最终回执可能滞留在 _pending_req_outputs
         # （最后一步之后没有再进 update 路径）——显式冲刷（审查 #2 配套）。
         for ro in self.scheduler.flush_final_outputs():
@@ -312,4 +362,4 @@ def _prewarm_rope(model, runtime_max_model_len: int) -> None:
         rope._ensure(runtime_max_model_len)
 
 
-__all__ = ["LLMEngine"]
+__all__ = ["LLMEngine", "EngineStepError"]
