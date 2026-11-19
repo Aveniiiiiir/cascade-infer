@@ -215,18 +215,24 @@ class LLMEngine:
             # 空步累积 pending，下一步 schedule 的深度断言锁死引擎
             outputs.extend(self.scheduler.update_from_output({}))
             return outputs
-        graph_path = self._try_graph_forward(sched_out)
-        if graph_path is not None:
-            logits, batch = graph_path
-        else:
-            batch = self.runner.prepare_batch(sched_out)
-            logits = self.runner.forward(batch, rope_ensure=False)  # 已预热
+        # 2026-11-19 验证包 A 的崩溃注入暴露：EngineStepError 此前只包裹
+        # 采样阶段——prepare/forward 阶段异常以裸 RuntimeError 逃逸，pending
+        # 悬空不复位 → 离线 generate 后引擎状态损坏（下一步深度断言锁死）。
+        # 整个执行阶段统一包裹（EngineStepError 自身透传不二次包装）。
         try:
+            graph_path = self._try_graph_forward(sched_out)
+            if graph_path is not None:
+                logits, batch = graph_path
+            else:
+                batch = self.runner.prepare_batch(sched_out)
+                logits = self.runner.forward(batch, rope_ensure=False)  # 已预热
             launch = self.runner.launch_sample(logits, sched_out, batch)
             sampled = launch.wait_tokens() if launch is not None else {}
+        except EngineStepError:
+            raise
         except Exception as exc:
-            # 采样/验证异常：必须弹出本步 pending（否则下一步 schedule 的
-            # 深度断言会把引擎锁死）。判死全部在途请求，回执随
+            # 引擎步任意阶段异常：必须弹出本步 pending（否则下一步 schedule
+            # 的深度断言会把引擎锁死）。判死全部在途请求，回执随
             # EngineStepError 带给服务层（审计 #3：丢弃回执 = 客户端挂死
             # 到 600s 超时）。
             raise EngineStepError(self.scheduler.fail_all_inflight()) from exc

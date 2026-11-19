@@ -9,7 +9,9 @@
 - 同步序引擎步（schedule → prepare → forward → sample → commit；
   ZOS 零开销异步三段式为后置增强——需 GPU 侧 token 喂数落地）
 - MTP 投机解码 + 置信度调度变长验证（采样式拒绝采样，累乘接受率 + 性能曲线定预算）
-- 批不变推理 + 确定性采样（RNG 种子 = f(seq_seed, token 绝对位置, 用途流)）
+- 确定性采样（RNG 种子 = f(seq_seed, token 绝对位置, 用途流)）+ 同批形状
+  重放 bit 级一致；**跨批形状 bit 级一致为 DeepInfer 级目标**（当前前向
+  的 MoE 分桶/注意力分块对批形状敏感，见 test_batch_invariance 的 xfail）
 - 结构化输出（xgrammar：regex / JSON schema / EBNF，异步编译 + 失败隔离）
 - CUDA Graph（按 batch 档位分档、全档共享 memory pool；真实 V2-Lite 已验证）
 - MoE 专家并行 EP + EPLB（代码就绪，**多卡联调为后置项**；单卡路径已验收）

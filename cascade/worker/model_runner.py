@@ -139,6 +139,19 @@ class ModelRunner:
             budget = int(free * cache_cfg.gpu_memory_utilization)
         else:
             budget = 256 * 2**20  # CPU 测试默认 256 MiB
+        # 2026-11-19 验证包 A 暴露：rope 预热（_prewarm_rope → _ensure 到
+        # 2×runtime 位置）在 KV 池分配之后执行——默认 max_model_len=163840
+        # 时预算吃光全部剩余显存，cos/sin 构造（≈3×84MB 峰值）直接 OOM。
+        # 此前真实模型测试全部显式传 max_model_len（4096/2048），默认路径
+        # 零覆盖。预留两项：
+        #   rope 构造峰值 ≈ 2×runtime×rope_dim×20B（pos/freqs/emb/cos/sin
+        #   fp32 峰值 + bf16 输出；163840 长度 ≈ 420MB）
+        #   激活 headroom 512MB（2000-token chunk 的 absorbed 前向 fp32
+        #   中间张量实测 ~150-300MB + CUDA 碎片；第二轮验证暴露）
+        runtime = self.engine_cfg.runtime_max_model_len
+        rope_reserve = 2 * runtime * self.cfg.qk_rope_head_dim * 20
+        activation_headroom = 512 * 2**20
+        budget = max(0, budget - rope_reserve - activation_headroom)
         n = derive_num_blocks(budget, self.cfg, cache_cfg.block_size)
         # 实际需求上界：所有并发 seq 的 KV 足迹（含投机余量）
         max_useful = (
