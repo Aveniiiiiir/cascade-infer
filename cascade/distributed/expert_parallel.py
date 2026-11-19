@@ -33,7 +33,9 @@ class ExpertParallelGroup:
 
     __slots__ = ("rank", "world_size", "group", "num_physical", "local_experts")
 
-    def __init__(self, rank: int, world_size: int, group=None, num_physical: int = 64) -> None:
+    def __init__(
+        self, rank: int, world_size: int, group: object | None = None, num_physical: int = 64
+    ) -> None:
         import torch.distributed as dist
 
         assert dist.is_available() and dist.is_initialized()
@@ -48,10 +50,10 @@ class ExpertParallelGroup:
 
     def dispatch(
         self,
-        hidden: "torch.Tensor",  # [T, H]（本 rank 的 token）
-        topk_physical_ids: "torch.Tensor",  # [T, K] int64（physical 专家 id）
-        topk_weight: "torch.Tensor",  # [T, K] fp32
-    ) -> tuple["torch.Tensor", "torch.Tensor"]:
+        hidden: torch.Tensor,  # [T, H]（本 rank 的 token）
+        topk_physical_ids: torch.Tensor,  # [T, K] int64（physical 专家 id）
+        topk_weight: torch.Tensor,  # [T, K] fp32
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """→ (recv_rows [T_r, H+3], recv_counts [W])。
 
         recv_rows 的 meta 列 = [源 token 序, 本地专家 id, 权重]。
@@ -102,11 +104,11 @@ class ExpertParallelGroup:
 
     def combine(
         self,
-        expert_out: "torch.Tensor",  # [T_r, H+3]：本地专家输出 + dispatch 的 meta 原样回传
-        recv_counts: "torch.Tensor",  # dispatch 返回（分块尺寸，对称回传）
+        expert_out: torch.Tensor,  # [T_r, H+3]：本地专家输出 + dispatch 的 meta 原样回传
+        recv_counts: torch.Tensor,  # dispatch 返回（分块尺寸，对称回传）
         orig_T: int,
         H: int,
-    ) -> "torch.Tensor":
+    ) -> torch.Tensor:
         """反向 all_to_all + 单次归约 → [orig_T, H]。"""
         import torch
         from torch.distributed import all_to_all_single

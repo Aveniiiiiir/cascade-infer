@@ -19,9 +19,10 @@ MTP 的乐观推进/提交回滚协议不变（scheduler._commit_optimistic_adva
 from __future__ import annotations
 
 import time
+from typing import TYPE_CHECKING
 
 from cascade.common.logger import get_logger
-from cascade.config import EngineConfig
+from cascade.config import EngineConfig, ModelConfig
 from cascade.core.block_manager import BlockManager
 from cascade.core.prefix_cache import PrefixCache
 from cascade.core.scheduler import Scheduler
@@ -29,6 +30,11 @@ from cascade.core.sequence import RequestOutput
 from cascade.sampling_params import SamplingParams
 from cascade.structured_output.builder import SOMatchersBuilder
 from cascade.worker.model_runner import ModelRunner
+
+if TYPE_CHECKING:
+    import torch
+
+    from cascade.core.scheduler import SchedulerOutput
 
 _log = get_logger("engine.llm_engine")
 
@@ -62,11 +68,11 @@ class LLMEngine:
         engine_cfg: EngineConfig,
         model_dir: str | None = None,
         device: str = "cuda",
-        dtype=None,
+        dtype: torch.dtype | None = None,
         num_blocks: int | None = None,
-        draft_model=None,  # DraftModel 协议（MTP；None = 关闭）
-        model=None,  # 预构建模型（引擎级测试免 checkpoint）
-        model_cfg=None,
+        draft_model: object | None = None,  # DraftModel 协议（MTP；None = 关闭）
+        model: torch.nn.Module | None = None,  # 预构建模型（引擎级测试免 checkpoint）
+        model_cfg: ModelConfig | None = None,
     ) -> None:
         import torch
 
@@ -121,7 +127,7 @@ class LLMEngine:
             self.graph_runner is not None,
         )
 
-    def _init_graph_runner(self, engine_cfg, device, dtype):
+    def _init_graph_runner(self, engine_cfg: EngineConfig, device: str, dtype: torch.dtype) -> object | None:
         import torch
 
         from cascade.common.env import envs
@@ -153,7 +159,7 @@ class LLMEngine:
             return None
 
     @property
-    def model_cfg(self):
+    def model_cfg(self) -> ModelConfig:
         return self.runner.cfg
 
     def add_request(
@@ -238,14 +244,13 @@ class LLMEngine:
                 self.runner.detach_so_matcher(ro.request_id)
         return outputs
 
-    def _try_graph_forward(self, sched_out):
+    def _try_graph_forward(self, sched_out: SchedulerOutput) -> tuple[object, object] | None:
         """纯 decode 批且档位可容纳 → CUDA graph 回放。
 
         Returns: (logits [n, vocab] bf16, decode 元数据 batch) 或 None。
         仅接受 decode 行（审查补充：1-token 的 mid-chunk prefill 行曾能
         混入 → sample_flags 失配 → 提交断言崩溃）。
         """
-        import torch
 
         if self.graph_runner is None:
             return None
@@ -328,7 +333,7 @@ class LLMEngine:
         else:
             assert len(sampling_params) == len(prompt_token_ids)
             params_list = list(sampling_params)
-        ids = [self.add_request(p, sp) for p, sp in zip(prompt_token_ids, params_list)]
+        ids = [self.add_request(p, sp) for p, sp in zip(prompt_token_ids, params_list, strict=True)]
         results: dict[str, list[int]] = {i: [] for i in ids}
         finish: dict[str, str] = {}
         while self.scheduler.has_unfinished_requests or self._so_staging:
@@ -351,7 +356,7 @@ class LLMEngine:
         return results
 
 
-def _prewarm_rope(model, runtime_max_model_len: int) -> None:
+def _prewarm_rope(model: torch.nn.Module, runtime_max_model_len: int) -> None:
     """把模型的 rope cos/sin 缓冲一次性扩容到位（eager 与图捕获共用）。
 
     位置上界：批内最大位置 = computed−1 ≤ num_tokens−2+num_new ≤

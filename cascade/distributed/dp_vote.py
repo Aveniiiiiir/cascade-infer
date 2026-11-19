@@ -38,7 +38,7 @@ class DPStepVoter:
         return "prefill" if any_work else "decode"
 
     @staticmethod
-    def exchange_flags(local_has_prefill: bool, group=None) -> list[bool]:
+    def exchange_flags(local_has_prefill: bool, group: object | None = None) -> list[bool]:
         """两轮 gloo allreduce 的本地等价：交换各 rank 的标志。
         集群用法：dist.all_gather_object；无分布式（单 rank）→ [local]。
 

@@ -58,10 +58,11 @@ class MLAAttention(nn.Module):
 
     def project_q(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """x [T,H] → (q_nope [T,h,128], q_rope [T,h,64])（未 rope）。"""
-        if self.cfg.q_lora_rank:
-            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x)))
-        else:
-            q = self.q_proj(x)
+        q = (
+            self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x)))
+            if self.cfg.q_lora_rank
+            else self.q_proj(x)
+        )
         T = x.shape[0]
         q = q.view(T, self.num_heads, self.qk_nope + self.qk_rope)
         return q[..., : self.qk_nope], q[..., self.qk_nope :]
@@ -140,7 +141,7 @@ class MLAAttention(nn.Module):
         """显式路径（HF 对拍 oracle）：逐段材料化 k_nope/v。"""
         outs = []
         offset = 0
-        for seg_i, seg_len in enumerate(segment_lens):
+        for seg_len in segment_lens:
             sl = slice(offset, offset + seg_len)
             out = self._attend_segment_explicit(
                 q_nope[sl], q_rope[sl], positions[sl],
@@ -203,14 +204,14 @@ class MLAAttention(nn.Module):
                 acc += n
             assert acc == T
             seqlens = torch.tensor(
-                [int(positions[o].item()) + n for o, n in zip(offsets, segment_lens)],
+                [int(positions[o].item()) + n for o, n in zip(offsets, segment_lens, strict=True)],
                 dtype=torch.int64,
                 device=kv.device,
             )
             # 多 token 段：prefill kernel（varlen 因果）
             multi_segs = [
                 (i, int(positions[o].item()), n)
-                for i, (o, n) in enumerate(zip(offsets, segment_lens))
+                for i, (o, n) in enumerate(zip(offsets, segment_lens, strict=True))
                 if n > 1
             ]
             if multi_segs:

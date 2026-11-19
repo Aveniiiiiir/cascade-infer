@@ -35,14 +35,15 @@ serves DP consensus voting and EPD disaggregation, both Phase 6+ concerns.
 
 from __future__ import annotations
 
+import contextlib
 from collections import deque
 from dataclasses import dataclass, field
 
 from cascade.common.logger import get_logger
 from cascade.config import EngineConfig
 from cascade.core.block_manager import BlockAllocationError, BlockManager
-from cascade.core.prefix_cache import PrefixCache
 from cascade.core.mtp_varlen import MtpVarlen
+from cascade.core.prefix_cache import PrefixCache
 from cascade.core.sequence import (
     RequestOutput,
     Sequence,
@@ -159,10 +160,9 @@ class Scheduler:
         """含已调度未提交（在途/悬空）的 seq。"""
         if self.waiting or self.running:
             return True
-        for out in self._pending_outputs:
-            if any(not s.seq.is_finished for s in out.scheduled):
-                return True
-        return False
+        return any(
+            not s.seq.is_finished for out in self._pending_outputs for s in out.scheduled
+        )
 
     def abort(self, request_id: str) -> bool:
         seq = self._find(request_id)
@@ -538,10 +538,8 @@ class Scheduler:
         self._mtp_rates.pop(seq.request_id, None)  # varlen 状态清理
         if seq in self.running:
             self.running.remove(seq)
-        try:
+        with contextlib.suppress(ValueError):
             self.waiting.remove(seq)
-        except ValueError:
-            pass
 
     def _truncate_new_tokens(
         self, seq: Sequence, new_tokens: list[int]

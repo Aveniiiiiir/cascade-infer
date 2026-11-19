@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+    branches: [master, code-review-fixes]
+  pull_request:
+
+jobs:
+  cpu-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      # tests/cpu 的设计契约：不依赖 torch/triton（torch 相关自动 skip）。
+      # 装 CPU 版 torch 使非 skip 集最大化（Windows 本机开发流同此）。
+      - name: Install deps
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e ".[dev]"
+      - name: CPU test suite
+        run: python -m pytest tests/cpu -p no:cacheprovider
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - run: ruff check cascade scripts
+
+  # GPU 验收不在 CI 范围：需要真实 CUDA + V2-Lite（37GB），见
+  # scripts/acceptance_full.sh 与 docs/验收报告（手动集群执行）。

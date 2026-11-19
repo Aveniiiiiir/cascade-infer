@@ -22,8 +22,7 @@ import torch.nn as nn
 from cascade.config import ModelConfig
 from cascade.model_executor.layers.layernorm import RMSNorm
 from cascade.model_executor.layers.linear import Linear
-from cascade.model_executor.layers.mla import MLAAttention
-from cascade.model_executor.layers.moe import DeepseekMoE, MLP
+from cascade.model_executor.layers.moe import MLP, DeepseekMoE
 
 
 class DraftModel(Protocol):

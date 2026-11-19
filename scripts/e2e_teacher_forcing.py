@@ -128,7 +128,7 @@ def main() -> None:
 
     total = match = 0
     worst = []
-    for i, ((seq, hlog), clog) in enumerate(zip(hf, casc)):
+    for i, ((seq, hlog), clog) in enumerate(zip(hf, casc, strict=False)):
         T = len(seq)
         m = 0
         n = 0

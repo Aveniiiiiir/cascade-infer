@@ -20,9 +20,13 @@ kernel in Phase 3.
 
 from __future__ import annotations
 
-from typing import Sequence as SequenceABC
+from collections.abc import Sequence as SequenceABC
+from typing import TYPE_CHECKING
 
 from cascade.sampling_params import MTP_SEED_OFFSET
+
+if TYPE_CHECKING:
+    import torch
 
 _MASK64 = (1 << 64) - 1
 _GOLDEN = 0x9E3779B97F4A7C15
@@ -84,7 +88,7 @@ def random_sampling_ref_pure(
 ) -> list[int]:
     """纯 Python 规范实现（无 torch 依赖，Windows/任意平台可跑）。"""
     out: list[int] = []
-    for row, seed, pos in zip(probs, seq_seeds, sample_positions):
+    for row, seed, pos in zip(probs, seq_seeds, sample_positions, strict=False):
         u = derive_uniform(seed, pos, case)
         out.append(sample_cdf_inverse(row, u))
     return out
@@ -98,13 +102,13 @@ def _i64(x: int) -> int:
     return x if x < 0x8000000000000000 else x - 0x10000000000000000
 
 
-def _urshift(x, n: int):
+def _urshift(x: torch.Tensor, n: int) -> torch.Tensor:
     """int64 张量的逻辑右移（无符号语义）。"""
     shifted = x.div(1 << n, rounding_mode="floor")
     return shifted + (x < 0).to(x.dtype) * (1 << (64 - n))
 
 
-def _hash_to_uniform(seed):
+def _hash_to_uniform(seed: torch.Tensor) -> torch.Tensor:
     """SplitMix64 of int64 tensor → float64 tensor in [0,1)。torch 版。"""
     import torch  # 局部导入：_hash_to_uniform 独立可用（_urshift 为鸭子类型）
 
@@ -117,11 +121,11 @@ def _hash_to_uniform(seed):
 
 
 def random_sampling_ref(
-    probs,
-    seq_seeds,
-    sample_positions,
+    probs: torch.Tensor,
+    seq_seeds: torch.Tensor,
+    sample_positions: torch.Tensor,
     is_nextn_predict: bool = False,
-):
+) -> torch.Tensor:
     """torch 向量化参考实现（设备无关，CPU 可跑）。
 
     bit 级对齐 DeepInfer random_sampling.py:70-84；Triton kernel 的

@@ -68,10 +68,11 @@ class MoEGate(nn.Module):
         （638/640 vs 631/640），先按实测路径保留 bf16 矩乘。
         """
         logits = x @ self.weight.T  # [T, E]
-        if self.cfg.scoring_func == "sigmoid":
-            scores = logits.float().sigmoid()
-        else:
-            scores = logits.float().softmax(dim=-1)
+        scores = (
+            logits.float().sigmoid()
+            if self.cfg.scoring_func == "sigmoid"
+            else logits.float().softmax(dim=-1)
+        )
         if self.cfg.has_e_score_correction_bias:
             scores_for_choice = scores + self.e_score_correction_bias.float().unsqueeze(0)
         else:
@@ -117,7 +118,6 @@ class DeepseekMoE(nn.Module):
         self.graph_pad_to: int | None = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        T = x.shape[0]
         topk_idx, topk_weight = self.gate(x)  # [T,k] int64 / fp32
         routed = fused_experts(
             x, self.w1, self.w3, self.w2, topk_weight,

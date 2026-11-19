@@ -23,7 +23,7 @@ def run(model, cfg, segs: list[list[int]], start_positions: list[int], blocks_pe
     lens = [len(s) for s in segs]
     flat = torch.tensor([t for s in segs for t in s], device="cuda")
     positions = torch.cat(
-        [torch.arange(sp, sp + n, device="cuda") for sp, n in zip(start_positions, lens)]
+        [torch.arange(sp, sp + n, device="cuda") for sp, n in zip(start_positions, lens, strict=False)]
     )
     seq_ids = torch.cat(
         [torch.full((n,), i, dtype=torch.long, device="cuda") for i, n in enumerate(lens)]

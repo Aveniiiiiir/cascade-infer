@@ -18,7 +18,7 @@ MTP 多步掩码用法（DeepInfer matcher.py:366-376 语义）：
 
 from __future__ import annotations
 
-from typing import Sequence
+from collections.abc import Sequence
 
 SO_STATUS_INACTIVE = 0
 SO_STATUS_ACTIVATING = 1
@@ -48,7 +48,9 @@ class XGrammarBackend(GrammarBackend):
 
     __slots__ = ("matcher", "vocab_size", "_buf")
 
-    def __init__(self, compiled_grammar, vocab_size: int, tokenizer_info=None) -> None:
+    def __init__(
+        self, compiled_grammar: object, vocab_size: int, tokenizer_info: object | None = None
+    ) -> None:
         import xgrammar  # 局部导入：仅集群路径
 
         if tokenizer_info is not None:

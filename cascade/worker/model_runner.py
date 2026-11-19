@@ -14,10 +14,8 @@ import torch
 
 from cascade.common.logger import get_logger
 from cascade.config import CacheConfig, EngineConfig, ModelConfig
-from cascade.core.scheduler import SchedulerOutput
-from cascade.config import ModelConfig
+from cascade.core.scheduler import ScheduledSeq, SchedulerOutput
 from cascade.model_executor.model_loader import load_deepseek_v2
-from cascade.model_executor.models.deepseek_v2 import DeepseekV2ForCausalLM
 from cascade.sampling.confidence import ConfidenceCalibrator
 from cascade.sampling.sampler import Sampler, build_sampling_rows
 from cascade.structured_output.matcher import SOMatcher  # noqa: F401  (类型引用)
@@ -59,7 +57,7 @@ class SampleLaunch:
     request_ids: list[str]
     pinned: torch.Tensor  # [R] int32 CPU（pinned；CUDA 事件守卫）
     event: object | None  # torch.cuda.Event（无 CUDA 时 None）
-    sched_out: "SchedulerOutput"  # 持有以简化引擎侧簿记（调试/未来 ZOS）
+    sched_out: SchedulerOutput  # 持有以简化引擎侧簿记（调试/未来 ZOS）
     #: MTP 验证行的结果（同步验证模式：sample 阶段已得到 CPU 列表；
     #: 多 token/seq）
     tokens_dict: dict[str, list[int]] | None = None
@@ -72,7 +70,7 @@ class SampleLaunch:
         if self.request_ids:
             if self.event is not None:
                 self.event.synchronize()
-            for rid, t in zip(self.request_ids, self.pinned.tolist()):
+            for rid, t in zip(self.request_ids, self.pinned.tolist(), strict=True):
                 out[rid] = [int(t)]
         return out
 
@@ -97,7 +95,7 @@ class ModelRunner:
         use_absorbed: bool = True,
         model: torch.nn.Module | None = None,
         model_cfg: ModelConfig | None = None,
-        draft_model=None,
+        draft_model: object | None = None,
     ) -> None:
         from cascade.common.env import envs
 
@@ -110,13 +108,13 @@ class ModelRunner:
         self.sampler = Sampler()
         #: MTP：草案模型（DraftModel 协议）与上一轮草案状态
         self.draft_model = draft_model
-        self._mtp_drafts: dict[str, "DraftInfo"] = {}
+        self._mtp_drafts: dict[str, DraftInfo] = {}
         #: 2026-11-18 审计 #6(a)：MTP 接受率回灌缓冲（引擎 step 消费 →
         #: scheduler.update_mtp_accept → varlen 逐 seq 验证长度的数据源）
         self._mtp_accept_feed: dict[str, list[float]] = {}
         self.calibrator = ConfidenceCalibrator()
         #: SO：matcher 句柄 + 本步失败集合（失败隔离）
-        self._so_matchers: dict[str, "SOMatcher"] = {}
+        self._so_matchers: dict[str, SOMatcher] = {}
         self._so_failed: set[str] = set()
         if model is not None:
             assert model_cfg is not None
@@ -344,7 +342,11 @@ class ModelRunner:
         rows_idx: list[int] = []
         sel_sched = []  # 与 sel 对齐的 ScheduledSeq（MTP 分流需要）
         for s, flag, off, n in zip(
-            sched_out.scheduled, batch.sample_flags, batch.segment_offsets, batch.segment_lens
+            sched_out.scheduled,
+            batch.sample_flags,
+            batch.segment_offsets,
+            batch.segment_lens,
+            strict=True,
         ):
             if not flag:
                 continue
@@ -367,7 +369,7 @@ class ModelRunner:
         plain_sel = []
         plain_rows: list[int] = []
         K = self.engine_cfg.scheduler.nextn_draft_tokens
-        for (rid, scalars, pos, golden), row_idx, s in zip(sel, rows_idx, sel_sched):
+        for (rid, scalars, pos, golden), row_idx, s in zip(sel, rows_idx, sel_sched, strict=True):
             if (not s.is_prefill) and K > 0:
                 # 段首的【批内】偏移 = 段末行偏移 + 1 - 段长（审查 #3：此前用
                 # 绝对 token 位置切片 logits，批内多行时读错行/越界）
@@ -416,7 +418,9 @@ class ModelRunner:
 
     # ------------------------------------------------------------------ MTP
 
-    def _verify_mtp_seq(self, logits: torch.Tensor, s, seq_seed: int, seg_off: int) -> list[int]:
+    def _verify_mtp_seq(
+        self, logits: torch.Tensor, s: ScheduledSeq, seq_seed: int, seg_off: int
+    ) -> list[int]:
         """单 seq 的 MTP 验证：logits 段 [1+K, V] + 上轮草案 → 提交 token。
 
         `seg_off` = 该段在**展平批内**的起始偏移（由 launch_sample 传入；
@@ -428,10 +432,10 @@ class ModelRunner:
         （真实状态由 post_process 的 committed 统一推进——见
         accept_so_committed）。掩码在 log_softmax 之前施加于 logits。
         """
-        from cascade.sampling.mtp_verify import mtp_verify
-        from cascade.sampling.rng import derive_uniform
         from cascade.model_executor.triton_ops.apply_so_bitmask import apply_token_bitmask
         from cascade.model_executor.triton_ops.common import CASE_SAMPLE, CASE_VERIFY
+        from cascade.sampling.mtp_verify import mtp_verify
+        from cascade.sampling.rng import derive_uniform
 
         seq = s.seq
         rows = logits[seg_off : seg_off + s.num_new_tokens].to(torch.float32)
@@ -539,7 +543,7 @@ class ModelRunner:
         self._mtp_accept_feed.clear()
         return items
 
-    def _launch_drafts(self, sched_out, mtp_tokens: dict[str, list[int]]) -> None:
+    def _launch_drafts(self, sched_out: SchedulerOutput, mtp_tokens: dict[str, list[int]]) -> None:
         """为下一步发射草案：输入 = 本步提交的末 token（同步验证模式下
         已在 CPU）。prefill 收尾的 seq 首个 decode 步无草案（fresh 行）。"""
         new_drafts: dict[str, DraftInfo] = {}

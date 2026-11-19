@@ -21,7 +21,7 @@ def main() -> None:
 
     # --- 引擎路径 ---
     out = llm.generate([PROMPT], max_tokens=6, temperature=0.0)
-    gen_ids = llm.tokenizer.encode(out[0]) if out[0] else []
+    _gen_ids = llm.tokenizer.encode(out[0]) if out[0] else []
     print("engine generate text:", repr(out[0]))
 
     # 用实际 token ids 重新跑一次拿 ids（generate 返回文本，直接取引擎输出）

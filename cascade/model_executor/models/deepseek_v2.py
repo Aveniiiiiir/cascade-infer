@@ -142,7 +142,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         if self.cfg.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
 
-    def to(self, *args, **kwargs):
+    def to(self, *args: object, **kwargs: object) -> DeepseekV2ForCausalLM:
         """nn.Module.to 之外同步 rope 缓冲的设备与 dtype。
 
         RotaryEmbedding 不是 nn.Module，cos/sin 缓冲不随 model.to 迁移——

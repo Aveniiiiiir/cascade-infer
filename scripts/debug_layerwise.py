@@ -66,11 +66,10 @@ def hf_probe(ids: list[int]):
 def cascade_probe(ids: list[int]):
     from transformers import AutoTokenizer
 
-    from cascade.config import CacheConfig
     from cascade.model_executor.model_loader import load_deepseek_v2
     from cascade.worker.cache_engine import CacheEngine
 
-    tok = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
+    _tok = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
     model, cfg = load_deepseek_v2(MODEL_DIR, device="cuda", dtype=torch.bfloat16)
     model.eval()
     T = len(ids)

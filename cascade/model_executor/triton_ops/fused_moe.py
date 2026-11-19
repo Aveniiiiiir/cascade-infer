@@ -202,7 +202,6 @@ def fused_experts_ref(
     """
     T, H = x.shape
     E, N, _ = w1.shape
-    K = topk_ids.shape[1]
     out = torch.zeros(T, H, dtype=x.dtype, device=x.device)
     for e in range(E):
         token_rows, k_slots = torch.nonzero(topk_ids == e, as_tuple=True)

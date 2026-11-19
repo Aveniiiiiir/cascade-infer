@@ -24,7 +24,7 @@ E, N, HID = 64, 1408, 2048
 SCALE = (128 + 64) ** -0.5
 
 
-def bench(fn, warmup: int = 10, iters: int = 50) -> float:
+def bench(fn: object, warmup: int = 10, iters: int = 50) -> float:
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()

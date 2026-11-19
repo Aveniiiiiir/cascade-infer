@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import hashlib
 from collections import OrderedDict, deque
-from typing import Sequence
+from collections.abc import Sequence
 
 from cascade.common.logger import get_logger
 from cascade.core.block_manager import BlockManager

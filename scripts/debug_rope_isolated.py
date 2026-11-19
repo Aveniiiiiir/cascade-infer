@@ -89,7 +89,7 @@ def main() -> None:
     q, k, pos = fixed_inputs()
     h = hf_rope(q, k, pos)
     c = cascade_rope(q, k, pos)
-    for name, a, b in zip(("q@rope", "k@rope", "cos", "sin"), h, c):
+    for name, a, b in zip(("q@rope", "k@rope", "cos", "sin"), h, c, strict=False):
         d = (a - b).abs()
         print(f"{name}: shape {tuple(a.shape)} vs {tuple(b.shape)} max|d|={d.max().item():.6f}")
     print("q input[0,0,:4]:", q[0, 0, :4].tolist())

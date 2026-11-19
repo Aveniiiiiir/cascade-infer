@@ -11,6 +11,7 @@
 2=活跃 / -1=失败（DeepInfer so_status 语义）。
 """
 
+from cascade.structured_output.builder import SOMatchersBuilder
 from cascade.structured_output.compiler import GrammarCompiler, has_xgrammar
 from cascade.structured_output.matcher import (
     SO_STATUS_ACTIVE,
@@ -19,7 +20,6 @@ from cascade.structured_output.matcher import (
     StubGrammarBackend,
     XGrammarBackend,
 )
-from cascade.structured_output.builder import SOMatchersBuilder
 
 __all__ = [
     "GrammarCompiler",

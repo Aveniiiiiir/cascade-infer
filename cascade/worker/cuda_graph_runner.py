@@ -66,7 +66,7 @@ class CudaGraphRunner:
 
     def __init__(
         self,
-        model,  # DeepseekV2ForCausalLM（bf16 on cuda）
+        model: torch.nn.Module,  # DeepseekV2ForCausalLM（bf16 on cuda）
         cache: CacheEngine,
         cfg: EngineConfig,
         device: str,

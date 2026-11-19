@@ -107,7 +107,7 @@ def cascade_probe(x: torch.Tensor):
     with torch.no_grad():
         q = attn.q_proj(x)
         qv = q.view(L, attn.num_heads, attn.qk_nope + attn.qk_rope)
-        q_nope, q_pe = qv[..., : attn.qk_nope], qv[..., attn.qk_nope :]
+        _q_nope, q_pe = qv[..., : attn.qk_nope], qv[..., attn.qk_nope :]
         c_raw = attn.kv_a_proj_with_mqa(x)
         c_norm = attn.kv_a_layernorm(c_raw[..., : attn.kv_lora])
         k_pe = c_raw[..., attn.kv_lora :]

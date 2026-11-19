@@ -114,12 +114,10 @@ class MtpVarlen:
         pairs.sort(reverse=True)
         allowed = total_q - n
         plan: dict[str, int] = {rid: 1 for rid in rates}
-        taken = 0
-        for _r, rid, _j in pairs:
+        for taken, (_r, rid, _j) in enumerate(pairs):
             if taken >= allowed:
                 break
             plan[rid] += 1
-            taken += 1
         return plan
 
     @staticmethod

@@ -93,7 +93,7 @@ def main() -> None:
     print("ids:", ids)
     h = hf_layers(ids)
     c = cascade_layers(ids)
-    for i, (a, b) in enumerate(zip(h, c)):
+    for i, (a, b) in enumerate(zip(h, c, strict=False)):
         d = (a - b).abs()
         print(f"layer {i:2d}: max|d|={d.max().item():.6f} mean|d|={d.mean().item():.6f}")
 

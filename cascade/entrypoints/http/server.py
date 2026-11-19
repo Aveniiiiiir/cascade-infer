@@ -27,16 +27,17 @@ import time
 import uuid
 from collections.abc import AsyncGenerator
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
 from cascade.common.logger import get_logger
+from cascade.core.sequence import RequestOutput
 from cascade.entrypoints.http.protocol import (
+    ChatCompletionChoice,
     ChatCompletionChunk,
     ChatCompletionChunkChoice,
     ChatCompletionChunkDelta,
-    ChatCompletionChoice,
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatMessage,
@@ -143,7 +144,7 @@ class AsyncEngine:
         for ro in self._engine.scheduler.flush_final_outputs():
             self._put(ro)
 
-    def _put(self, ro) -> None:
+    def _put(self, ro: RequestOutput) -> None:
         with self._lock:
             alive = ro.request_id in self._active
             if alive:
@@ -296,7 +297,7 @@ def create_app(llm: LLM, api_key: str | None = None) -> FastAPI:
 
     if api_key:
         @app.middleware("http")
-        async def _check_api_key(request, call_next):
+        async def _check_api_key(request: Request, call_next: object) -> Response:
             auth = request.headers.get("Authorization", "")
             if not auth.startswith("Bearer ") or auth[len("Bearer "):] != api_key:
                 return JSONResponse(
@@ -310,7 +311,7 @@ def create_app(llm: LLM, api_key: str | None = None) -> FastAPI:
         return {"object": "list", "data": [{"id": model_name, "object": "model"}]}
 
     @app.post("/v1/chat/completions")
-    async def chat_completions(req: ChatCompletionRequest):
+    async def chat_completions(req: ChatCompletionRequest) -> object:
         ids = _chat_prompt_ids(llm, req.messages)
         if (err := _validate_prompt(llm, ids)) is not None:
             return err
@@ -361,7 +362,9 @@ def create_app(llm: LLM, api_key: str | None = None) -> FastAPI:
             ),
         )
 
-    async def _stream_chat(engine: AsyncEngine, llm: LLM, rid: str, model: str, created: int):
+    async def _stream_chat(
+        engine: AsyncEngine, llm: LLM, rid: str, model: str, created: int
+    ) -> AsyncGenerator[dict, None]:
         first = True
         acc_tokens: list[int] = []
         acc_text = ""
@@ -395,7 +398,7 @@ def create_app(llm: LLM, api_key: str | None = None) -> FastAPI:
         yield {"data": "[DONE]"}
 
     @app.post("/v1/completions")
-    async def completions(req: CompletionRequest):
+    async def completions(req: CompletionRequest) -> object:
         prompts = req.prompt if isinstance(req.prompt, list) else [req.prompt]
         if len(prompts) != 1:
             return _bad_request("仅支持单 prompt")

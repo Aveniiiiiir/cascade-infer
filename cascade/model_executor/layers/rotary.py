@@ -16,7 +16,6 @@ import math
 
 import torch
 
-
 # --------------------------------------------------------------------- YaRN 数学
 
 def _yarn_find_correction_dim(
@@ -118,7 +117,7 @@ class RotaryEmbedding:
 
     # ------------------------------------------------------------------ 设备/精度
 
-    def to(self, device: str | torch.device, dtype: torch.dtype | None = None) -> "RotaryEmbedding":
+    def to(self, device: str | torch.device, dtype: torch.dtype | None = None) -> RotaryEmbedding:
         """把 cos/sin/inv_freq 缓冲迁到目标设备（可选 dtype）。
 
         真实模型路径：`DeepseekV2ForCausalLM(cfg, device="cpu")` 构造后

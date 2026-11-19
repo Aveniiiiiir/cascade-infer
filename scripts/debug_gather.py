@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import os
 
-import torch
-
 MODEL_DIR = os.environ.get("CASCADE_E2E_MODEL", "/root/autodl-tmp/DeepSeek-V2-Lite")
 PROMPT = "The capital of France is"
 

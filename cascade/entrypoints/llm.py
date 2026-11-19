@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Any
 
 
 class LLM:
@@ -61,7 +62,7 @@ class LLM:
         self._tokenizer = None
 
     @property
-    def tokenizer(self):
+    def tokenizer(self) -> Any:
         if self._tokenizer is None:
             from transformers import AutoTokenizer
 
@@ -113,7 +114,7 @@ def main() -> None:
     )
     if args.prompt:
         outs = llm.generate(args.prompt, max_tokens=args.max_tokens, temperature=args.temperature)
-        for p, o in zip(args.prompt, outs):
+        for p, o in zip(args.prompt, outs, strict=True):
             print(f"---\n{p}\n{o}")
         return
     # 交互模式：逐条生成

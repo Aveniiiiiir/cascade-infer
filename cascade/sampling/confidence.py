@@ -51,7 +51,7 @@ class ConfidenceCalibrator:
             self._ema[b] = self.beta * self._ema[b] + (1.0 - self.beta) * obs
 
     def update_batch(self, p_top1s: list[float], accept_probs: list[float]) -> None:
-        for p, a in zip(p_top1s, accept_probs):
+        for p, a in zip(p_top1s, accept_probs, strict=False):
             self.update(p, a)
 
     def calibrated_confidences(self, p_top1s: list[float]) -> list[float]:

@@ -9,12 +9,11 @@ from __future__ import annotations
 
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from cascade.common.logger import get_logger
 from cascade.structured_output.compiler import Grammar, GrammarCompiler
 from cascade.structured_output.matcher import (
-    SO_STATUS_FAILED,
     GrammarBackend,
     SOMatcher,
     StubGrammarBackend,
