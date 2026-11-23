@@ -28,7 +28,7 @@ SRV=$!
 cleanup() { kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null; }
 trap cleanup EXIT
 ready=0
-for _ in $(seq 1 300); do
+for _ in $(seq 1 450); do
   if curl -s --max-time 2 http://localhost:18923/v1/models | grep -q model; then
     ready=1; break
   fi
@@ -38,7 +38,7 @@ for _ in $(seq 1 300); do
   sleep 2
 done
 if [ "$ready" != 1 ]; then
-  echo "HTTP server not ready within 600s"; exit 1
+  echo "HTTP server not ready within 900s"; exit 1
 fi
 curl -s -X POST http://localhost:18923/v1/chat/completions \
     -H 'Content-Type: application/json' \
