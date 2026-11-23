@@ -16,14 +16,14 @@ python -m pytest tests/cpu -q
 python -m pytest tests/model tests/triton_ops tests/engine -q
 python -m pytest tests/e2e -q
 
-python -m cascade.entrypoints.llm --model "$CASCADE_E2E_MODEL" \
+CASCADE_CUDAGRAPH=0 python -m cascade.entrypoints.llm --model "$CASCADE_E2E_MODEL" \
     --prompt "The capital of France is" --prompt "def hello():" --max-tokens 16
 
 # HTTP serving 冒烟（后台起服务 → 就绪探测 → 1 条请求 → 关闭）
 # 2026-11-18 修复：原 `sleep 30` 对真实模型必然失败——V2-Lite 从数据盘
 # 加载需 ~400s；且 set -e 失败路径不清理服务进程。改为就绪探测（最长
 # 600s）+ trap 兜底清理。
-python -m cascade.entrypoints.http.server --model "$CASCADE_E2E_MODEL" --port 18923 &
+CASCADE_CUDAGRAPH=0 python -m cascade.entrypoints.http.server --model "$CASCADE_E2E_MODEL" --port 18923 &
 SRV=$!
 cleanup() { kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null; }
 trap cleanup EXIT
