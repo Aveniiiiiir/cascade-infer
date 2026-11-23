@@ -42,8 +42,12 @@ PROMPTS = [
 
 
 @pytest.fixture(scope="module")
-@pytest.mark.timeout(900)  # fixture 加载 29GB 真实模型需 8-10 分钟（全局 120s 会杀掉）
 def llm() -> object:
+    """模块级共享 LLM（fixture 加载 29GB 真实模型需 8-10 分钟）。
+
+    注意：pytest 不允许 mark 加在 fixture 上；fixture setup 时间计入
+    首个使用它的测试的 timeout——各测试已标 @pytest.mark.timeout(900)。
+    """
     from cascade.entrypoints.llm import LLM
 
     return LLM(
