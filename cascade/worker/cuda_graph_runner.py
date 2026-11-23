@@ -203,7 +203,13 @@ class CudaGraphRunner:
         positions: list[int],  # 真实行的绝对位置
         block_rows: list[list[int]],  # 真实行的 block 表
     ) -> torch.Tensor:
-        """原地写输入 → 回放 → hidden [T, H]（前 n 行为真实结果）。"""
+        """原地写输入 → 回放 → hidden [T, H]（前 n 行为真实结果）。
+
+        2026-11-23 评审 #1（高危）：padding 行的 block_tables 必须在**每次**
+        回放时重置为 scratch——否则上一次同档位更大 n 的真实块表残留，
+        store_paged_kv 对全部 T 行写入 → 垃圾 latent 落入活跃 seq 的
+        KV 位置（批收缩即触发，服务稳态频繁发生）。
+        """
         n = len(tokens)
         assert n <= self.max_batch_size
         tier = self._select(n)
@@ -214,6 +220,9 @@ class CudaGraphRunner:
         for i, row in enumerate(block_rows):
             bt[i, : len(row)] = torch.as_tensor(row, dtype=torch.int64)
         tier.block_tables[:n].copy_(bt.to(dev))
+        # 高危修复：重置 padding 行的块表指向 scratch（μs 级 fill kernel）
+        if n < tier.size:
+            tier.block_tables[n:].fill_(self.scratch_block)
         tier.graph.replay()
         return tier.hidden
 

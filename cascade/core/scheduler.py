@@ -117,7 +117,10 @@ class Scheduler:
         self._pending_req_outputs: list[RequestOutput] = []
         #: 本步被抢占的 seq（含 STOP/RECOMPUTE），调度循环内跳过
         self._preempted_this_step: set[str] = set()
-        self._trace: list[str] = []
+        # 2026-11-23 评审 #2（高危）：deque 上限——生产链路从不 drain_trace，
+        # list 无限增长（64 seq 约 1KB/步 → server 一天 2-10GB 泄漏）。
+        # 保最近 1024 行供崩溃诊断。
+        self._trace: deque[str] = deque(maxlen=1024)
         #: MTP varlen：per-seq 累乘率（引擎在验证后回灌 accept_probs）
         self._mtp_rates: dict[str, list[float]] = {}
         self._mtp_varlen = (
