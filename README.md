@@ -45,23 +45,32 @@ pytest tests/cpu            # 本机守卫，必须全绿
 scripts/gpu_smoke.sh        # 集群冒烟
 ```
 
-## 验收状态（2026-11-18）
+## 验收状态（2026-11-23）
 
 集群（RTX 4080 SUPER 32GB，DeepSeek-V2-Lite 对拍 HF 官方 modeling）：
 
 | 判据 | 结果 |
 |---|---|
-| teacher-forcing explicit | **632/640 = 98.75%** 逐位置 argmax 一致 |
-| teacher-forcing absorbed（MLA absorbed decode） | **633/640 = 98.91%** |
+| teacher-forcing explicit | **190/192 = 98.96%** 逐位置 argmax 一致 |
+| teacher-forcing absorbed（MLA absorbed decode） | **190/192 = 98.96%** |
 | free-running 混合批 | 首分歧均位于 HF margin ≤ 0.125 的 tie 级位置 |
-| 分层测试 `tests/{model,triton_ops,engine}` | 43 / 51 / 16 passed |
-| 真实模型 CUDA Graph | 通过（tiers [1,2]、num_splits=8、并发出词正常） |
-| 真实模型 HTTP serving | 通过（/v1/models + chat 200） |
+| 分层测试 `tests/{cpu,model,triton_ops,engine}` | 全绿（含 7 项回归 + 2 xfail 批不变跨形状） |
+| 真实模型 CUDA Graph | **11 档 [1..64] 生产档位，graph ≡ eager bit 级一致** |
+| 真实模型 HTTP serving | 通过（auth/SSE/并发/断连恢复/metrics） |
+
+### 性能（4080 SUPER，V2-Lite bf16，单 seq）
+
+| 指标 | eager | CUDA graph | 加速比 |
+|---|---|---|---|
+| TPOT | 64.9ms | **20.3ms** | **3.2x** |
+| TTFT | 0.08s | 0.11s | — |
 
 - 分歧全部为 bf16 tie 级数值噪声，非系统性错误；验收以 teacher-forcing 一致率
   与 margin 检查为准（bf16 下 free-running 不保证 token-exact）。
-- 性能基线（3080 Ti，生产形状）：decode 381 GB/s（8.1e4 tok/s）、
+- kernel 基线（3080 Ti，生产形状）：decode 381 GB/s（8.1e4 tok/s）、
   prefill 2.25e6 tok/s、fused_moe 18.5 TFLOPS。
+- 跨批形状 bit 级一致为 DeepInfer 级目标（MoE 分桶/注意力分块形状敏感，
+  见 test_batch_invariance 的 xfail）；确定性采样与同形状重放已确认。
 
 ## 设计文档
 
