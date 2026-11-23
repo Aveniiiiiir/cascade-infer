@@ -237,7 +237,8 @@ def test_greedy_tokens_match_hf() -> None:
             f"teacher-forcing {name}: argmax 一致率 {m}/{n} = {rate:.4f} < {min_rate}；"
             f"前 5 处分歧 {bad[:5]}"
         )
-        assert all(b[4] < margin_tol for b in bad_margins), (
+        # <= 而非 <：margin 恰好等于 0.25 时仍是 tie 级（阈值边界语义）
+        assert all(b[4] <= margin_tol for b in bad_margins), (
             f"teacher-forcing {name}: 存在非 tie 级分歧 {bad_margins[:5]}"
         )
 
