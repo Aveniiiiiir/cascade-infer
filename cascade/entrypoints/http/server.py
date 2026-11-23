@@ -82,6 +82,12 @@ class AsyncEngine:
         self._active: set[str] = set()  # 消费方仍在消费的 rid
         self._buffers: dict[str, list] = {}  # rid → [RequestOutput]
         self._finished: dict[str, str] = {}  # rid → finish_reason
+        #: 2026-11-23：生产可观测性（/metrics）——finish 分布 + 步数/错误/abort
+        self._metrics: dict[str, int] = {
+            "tokens_generated": 0, "aborts": 0,
+            "engine_steps": 0, "engine_step_errors": 0,
+        }
+        self._finish_counts: dict[str, int] = {}
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._engine_loop, daemon=True, name="cascade-engine")
         self._thread.start()
@@ -126,13 +132,16 @@ class AsyncEngine:
                     time.sleep(0.005)
                 continue
             try:
+                self._metrics["engine_steps"] += 1
                 outputs = self._engine.step()
             except EngineStepError as ese:
+                self._metrics["engine_step_errors"] += 1
                 # 审计 #3：引擎层已复位 pending 并携带判死回执——必须 _put
                 # 它们，否则在途客户端各自挂满 600s 超时
                 _log.exception("engine step failed; failing all in-flight requests")
                 outputs = list(ese.receipts)
             except Exception:
+                self._metrics["engine_step_errors"] += 1
                 _log.exception("engine step failed; failing all in-flight requests")
                 outputs = self._engine.scheduler.fail_all_inflight()
             for ro in outputs:
@@ -149,8 +158,11 @@ class AsyncEngine:
             alive = ro.request_id in self._active
             if alive:
                 self._buffers.setdefault(ro.request_id, []).append(ro)
+                self._metrics["tokens_generated"] += len(ro.new_token_ids)
                 if ro.finish_reason is not None:
                     self._finished[ro.request_id] = ro.finish_reason
+                    r = ro.finish_reason
+                    self._finish_counts[r] = self._finish_counts.get(r, 0) + 1
         if not alive:
             # 审计 #4：消费方已退出（断连/超时清理后）的迟到输出——丢弃并
             # 止损。_put 在引擎线程执行，直接 abort 无跨线程竞态。
@@ -176,6 +188,8 @@ class AsyncEngine:
         """
         with self._lock:
             known = rid in self._active
+            if known:
+                self._metrics["aborts"] += 1
         if known:
             self._abort_queue.put(rid)
         return known
@@ -219,6 +233,52 @@ class AsyncEngine:
                     self._abort_queue.put(rid)
 
         return gen()
+
+    # ------------------------------------------------------------------ metrics
+
+    def metrics_text(self) -> str:
+        """Prometheus 文本格式（v0.0.4；零新依赖）。"""
+        with self._lock:
+            finish = dict(self._finish_counts)
+            m = dict(self._metrics)
+            inflight = len(self._active)
+        sched = self._engine.scheduler
+        bm = self._engine.block_mgr
+        lines = [
+            "# HELP cascade_requests_total Finished requests by finish reason.",
+            "# TYPE cascade_requests_total counter",
+        ]
+        for reason, n in sorted(finish.items()):
+            lines.append(f'cascade_requests_total{{finish="{reason}"}} {n}')
+        lines += [
+            "# HELP cascade_requests_inflight Consumer-active requests.",
+            "# TYPE cascade_requests_inflight gauge",
+            f"cascade_requests_inflight {inflight}",
+            "# HELP cascade_tokens_generated_total Generated tokens.",
+            "# TYPE cascade_tokens_generated_total counter",
+            f"cascade_tokens_generated_total {m['tokens_generated']}",
+            "# HELP cascade_aborts_total Aborted requests.",
+            "# TYPE cascade_aborts_total counter",
+            f"cascade_aborts_total {m['aborts']}",
+            "# HELP cascade_engine_steps_total Engine steps executed.",
+            "# TYPE cascade_engine_steps_total counter",
+            f"cascade_engine_steps_total {m['engine_steps']}",
+            "# HELP cascade_engine_step_errors_total Engine steps that raised.",
+            "# TYPE cascade_engine_step_errors_total counter",
+            f"cascade_engine_step_errors_total {m['engine_step_errors']}",
+            "# HELP cascade_waiting_seqs Queued (waiting) sequences.",
+            "# TYPE cascade_waiting_seqs gauge",
+            f"cascade_waiting_seqs {len(sched.waiting)}",
+            "# HELP cascade_running_seqs Running sequences.",
+            "# TYPE cascade_running_seqs gauge",
+            f"cascade_running_seqs {len(sched.running)}",
+            "# HELP cascade_kv_blocks KV block pool usage.",
+            "# TYPE cascade_kv_blocks gauge",
+            f'cascade_kv_blocks{{state="used"}} {bm.num_allocated_blocks}',
+            f'cascade_kv_blocks{{state="free"}} {bm.num_free_blocks}',
+            f'cascade_kv_blocks{{state="total"}} {bm.capacity}',
+        ]
+        return "\n".join(lines) + "\n"
 
     def shutdown(self) -> None:
         self._stop.set()
@@ -305,6 +365,10 @@ def create_app(llm: LLM, api_key: str | None = None) -> FastAPI:
                     status_code=401,
                 )
             return await call_next(request)
+
+    @app.get("/metrics")
+    def metrics() -> Response:
+        return Response(engine.metrics_text(), media_type="text/plain; version=0.0.4")
 
     @app.get("/v1/models")
     def list_models() -> dict:

@@ -121,6 +121,36 @@ def test_chat_completions_stream() -> None:
         assert last["choices"][0]["finish_reason"] == "length"
 
 
+def test_metrics_endpoint() -> None:
+    """/metrics：Prometheus 文本格式（计数/队列/KV 池）。"""
+    client, app = _make_client()
+    r = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tiny-test",
+            "messages": [{"role": "user", "content": "abc"}],
+            "max_tokens": 4,
+            "temperature": 0.0,
+        },
+    )
+    assert r.status_code == 200
+    m = client.get("/metrics")
+    assert m.status_code == 200
+    assert m.headers["content-type"].startswith("text/plain")
+    text = m.text
+    for key in (
+        "cascade_requests_total",
+        "cascade_tokens_generated_total",
+        "cascade_engine_steps_total",
+        "cascade_kv_blocks",
+        "cascade_waiting_seqs",
+        "cascade_running_seqs",
+    ):
+        assert key in text, f"missing metric {key}"
+    assert 'finish="length"' in text  # 上方请求以 length 收尾
+    app.state  # keep refs
+
+
 def test_completions_endpoint() -> None:
     client, app = _make_client()
     r = client.post(
