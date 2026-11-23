@@ -42,6 +42,7 @@ PROMPTS = [
 
 
 @pytest.fixture(scope="module")
+@pytest.mark.timeout(900)  # fixture 加载 29GB 真实模型需 8-10 分钟（全局 120s 会杀掉）
 def llm() -> object:
     from cascade.entrypoints.llm import LLM
 
@@ -78,6 +79,7 @@ _CROSS_SHAPE_XFAIL = pytest.mark.xfail(
 
 
 @_CROSS_SHAPE_XFAIL
+@pytest.mark.timeout(900)
 def test_batched_equals_single_temperature_sampling(llm: object) -> None:
     """温度采样（非贪心）：混批 generate ≡ 逐条独立运行（同 seed）。"""
     tok = llm.tokenizer
@@ -100,6 +102,7 @@ def test_batched_equals_single_temperature_sampling(llm: object) -> None:
 
 
 @_CROSS_SHAPE_XFAIL
+@pytest.mark.timeout(900)
 def test_batched_equals_single_greedy(llm: object) -> None:
     """贪心（eps 温度退化路径）：混批 ≡ 逐条。"""
     tok = llm.tokenizer
@@ -113,6 +116,7 @@ def test_batched_equals_single_greedy(llm: object) -> None:
         assert got == batch[i], f"greedy prompt {i} 批/单不一致"
 
 
+@pytest.mark.timeout(900)
 def test_same_seed_reproducible(llm: object) -> None:
     """同 seed 两次运行 bit 级一致（确定性采样）。"""
     tok = llm.tokenizer
