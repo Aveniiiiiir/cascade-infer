@@ -151,6 +151,16 @@ def test_metrics_endpoint() -> None:
     app.state  # keep refs
 
 
+def test_body_too_large_rejected() -> None:
+    """评审 #3：请求体 > 10MB → 413（uvicorn 默认不限）。"""
+    client, app = _make_client()
+    big = b'{"messages":[{"role":"user","content":"' + b"x" * (11 * 2**20) + b'"}]}'
+    r = client.post("/v1/chat/completions", content=big,
+                    headers={"Content-Type": "application/json"})
+    assert r.status_code == 413
+    app.state  # keep refs
+
+
 def test_completions_endpoint() -> None:
     client, app = _make_client()
     r = client.post(
