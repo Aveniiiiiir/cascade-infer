@@ -75,10 +75,15 @@ def _params(llm: object, temperature: float, seed_base: int, n: int) -> list:
 #   逐 token logits 有 tie 级差异（贪心 20 步后分叉，温度 0.7 位置 3
 #   分叉）。这是与 DeepInfer 的已知差距（其 kernel 专为跨形状确定设计），
 #   非实现 bug——xfail 严格跟踪，跨形状确定化落地时移除。
+# 2026-11-24 实测：该测试在不同运行间时而通过时而分叉（贪心 20 步后
+# bf16 tie 级噪声累积决定是否翻转）——非稳定失败。strict=True 会让偶然
+# 通过变成 XPASS 失败，故用 strict=False 记录性质：通过说明该次批组合
+# 数值上恰好一致，不通过说明形状敏感差异显现。同形状重放（同 seed 两次
+# 相同 workload）是确定性硬门槛，不受影响。
 _CROSS_SHAPE_XFAIL = pytest.mark.xfail(
     reason="前向数值路径批形状敏感（MoE 分桶/注意力分块布局）——跨形状 "
            "bit 级一致为 DeepInfer 级目标，当前仅 RNG 流与同形状重放确定",
-    strict=True,
+    strict=False,
 )
 
 
