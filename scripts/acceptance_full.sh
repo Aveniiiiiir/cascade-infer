@@ -25,7 +25,8 @@ CASCADE_CUDAGRAPH=0 python -m cascade.entrypoints.llm --model "$CASCADE_E2E_MODE
 # 600s）+ trap 兜底清理。
 CASCADE_CUDAGRAPH=0 python -m cascade.entrypoints.http.server --model "$CASCADE_E2E_MODEL" --port 18923 &
 SRV=$!
-cleanup() { kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null; }
+# wait 对被 kill 的进程返回 143，set -e 会因此终止脚本——显式吞掉
+cleanup() { kill "$SRV" 2>/dev/null || true; wait "$SRV" 2>/dev/null || true; }
 trap cleanup EXIT
 ready=0
 for _ in $(seq 1 450); do
