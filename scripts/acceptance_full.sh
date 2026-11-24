@@ -40,9 +40,11 @@ done
 if [ "$ready" != 1 ]; then
   echo "HTTP server not ready within 900s"; exit 1
 fi
-curl -s -X POST http://localhost:18923/v1/chat/completions \
-    -H 'Content-Type: application/json' \
-    -d '{"messages":[{"role":"user","content":"Hi"}],"max_tokens":8}' | grep -q chat.completion
+chat_resp=$(curl -s --max-time 120 -X POST http://localhost:18923/v1/chat/completions     -H 'Content-Type: application/json'     -d '{"messages":[{"role":"user","content":"Hi"}],"max_tokens":8}' || true)
+if ! printf '%s' "$chat_resp" | grep -q chat.completion; then
+  echo "chat completions failed: ${chat_resp:0:300}"
+  exit 1
+fi
 trap - EXIT
 cleanup
 
