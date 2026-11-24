@@ -21,6 +21,8 @@
 from __future__ import annotations
 
 import argparse
+import hmac
+import json
 import queue
 import threading
 import time
@@ -51,6 +53,11 @@ _log = get_logger("http.serving")
 
 _POLL_INTERVAL = 0.01  # 流式轮询（v1 桥接）
 _REQUEST_TIMEOUT_S = 600.0  # 单请求 wall-clock 上限（防引擎挂死拖死连接）
+_MAX_BODY_BYTES = 10 * 2**20  # 请求体上限 10MB（评审 #3：uvicorn 默认不限）
+_MAX_QUEUE_DEPTH = 4096  # 排队深度上限（评审 #3：超额 429，防内存膨胀）
+#: 判死类 finish reason（评审 #6：必须以 5xx / error 载荷下发）
+_ERROR_FINISH = frozenset({"error", "abort", "preempt", "so_failed", "ignored"})
+_STREAM_HOLDBACK = 2  # 流式增量解码的 BPE 边界 holdback（评审 #4）
 
 
 def _bad_request(msg: str) -> JSONResponse:
@@ -123,6 +130,10 @@ class AsyncEngine:
                         _log.warning("add_request rejected %s: %s", rid, e)
                         with self._lock:
                             self._finished[rid] = "error"
+                            # 评审 #15：拒绝也计入 finish 分布（否则监控看不见）
+                            self._finish_counts["error"] = (
+                                self._finish_counts.get("error", 0) + 1
+                            )
             except queue.Empty:
                 pass
             # 2. 引擎步进（有活才跑）
@@ -173,7 +184,11 @@ class AsyncEngine:
 
     # ------------------------------------------------------------------ public
 
-    def submit(self, prompt_ids: list[int], params: SamplingParams) -> str:
+    def submit(self, prompt_ids: list[int], params: SamplingParams) -> str | None:
+        """→ rid；排队超限返回 None（调用方回 429，评审 #3：防内存膨胀）。"""
+        if self._queue.qsize() >= _MAX_QUEUE_DEPTH:
+            _log.warning("request queue full (%d), rejecting", self._queue.qsize())
+            return None
         rid = f"chat-{uuid.uuid4().hex[:12]}"
         with self._lock:
             self._active.add(rid)
@@ -355,11 +370,35 @@ def create_app(llm: LLM, api_key: str | None = None) -> FastAPI:
     engine = AsyncEngine(llm)
     model_name = getattr(llm, "_model_dir", "cascade") or "cascade"
 
+    # 评审 #3：请求体大小上限（uvicorn 默认不限；GB 级 JSON 可打爆进程）
+    @app.middleware("http")
+    async def _limit_body(request: Request, call_next: object) -> Response:
+        cl = request.headers.get("content-length")
+        if cl is not None:
+            try:
+                too_big = int(cl) > _MAX_BODY_BYTES
+            except ValueError:
+                return JSONResponse(
+                    {"error": {"message": "invalid Content-Length", "type": "invalid_request_error"}},
+                    status_code=400,
+                )
+            if too_big:
+                return JSONResponse(
+                    {"error": {"message": f"request body too large (> {_MAX_BODY_BYTES} B)",
+                               "type": "invalid_request_error"}},
+                    status_code=413,
+                )
+        return await call_next(request)
+
     if api_key:
         @app.middleware("http")
         async def _check_api_key(request: Request, call_next: object) -> Response:
             auth = request.headers.get("Authorization", "")
-            if not auth.startswith("Bearer ") or auth[len("Bearer "):] != api_key:
+            # 评审 #8：常数时间比较（逐字节短路可被计时侧信道恢复 key）
+            token = auth[len("Bearer "):] if auth.startswith("Bearer ") else ""
+            if not auth.startswith("Bearer ") or not hmac.compare_digest(
+                token.encode(), api_key.encode()
+            ):
                 return JSONResponse(
                     {"error": {"message": "invalid api key", "type": "auth_error"}},
                     status_code=401,
@@ -398,6 +437,11 @@ def create_app(llm: LLM, api_key: str | None = None) -> FastAPI:
         except ValueError as e:
             return _bad_request(str(e))
         rid = engine.submit(ids, sp)
+        if rid is None:  # 评审 #3：排队超限 → 429
+            return JSONResponse(
+                {"error": {"message": "server busy (request queue full)", "type": "rate_limit"}},
+                status_code=429,
+            )
         created = int(time.time())
         if req.stream:
             return EventSourceResponse(_stream_chat(engine, llm, rid, req.model or model_name, created))
@@ -408,9 +452,13 @@ def create_app(llm: LLM, api_key: str | None = None) -> FastAPI:
             tokens.extend(ro.new_token_ids)
             if ro.finish_reason is not None:
                 finish = ro.finish_reason
-        if finish == "error":
+        # 评审 #6：判死类 finish（abort/error/preempt/...）必须以 5xx 下发——
+        # 此前只有 "error" 映射 500，引擎步异常判死的 "abort" 会以 200 +
+        # 半截文本返回，客户端 SDK 视为成功。
+        if finish in _ERROR_FINISH:
             return JSONResponse(
-                {"error": {"message": "request rejected by engine", "type": "engine_error"}},
+                {"error": {"message": f"request terminated by engine ({finish})",
+                           "type": "engine_error"}},
                 status_code=500,
             )
         text = llm.tokenizer.decode(tokens)
@@ -429,21 +477,31 @@ def create_app(llm: LLM, api_key: str | None = None) -> FastAPI:
     async def _stream_chat(
         engine: AsyncEngine, llm: LLM, rid: str, model: str, created: int
     ) -> AsyncGenerator[dict, None]:
+        """SSE 流式。评审 #4：增量解码（旧实现每 chunk 对累计全量 token 做
+        O(n²) 重解码，且在 async 生成器内同步阻塞事件循环——4096 token 的
+        流会冻结所有并发请求约 12s）。现仅解码新增 token，用 2 token
+        holdback 处理 BPE 边界合并（尾 token 可能被后续 token 改变）。
+        """
         first = True
-        acc_tokens: list[int] = []
-        acc_text = ""
+        pending: list[int] = []  # 尚未解码发出的 token（含 holdback）
         finish = "stop"
         async for ro in engine.iter_outputs(rid):
-            acc_tokens.extend(ro.new_token_ids)
-            if ro.finish_reason is not None:
+            pending.extend(ro.new_token_ids)
+            final = ro.finish_reason is not None
+            if final:
                 finish = ro.finish_reason
-            new_text = llm.tokenizer.decode(acc_tokens)
-            delta = new_text[len(acc_text) :] if len(new_text) >= len(acc_text) else new_text
-            acc_text = new_text
+                delta_text = llm.tokenizer.decode(pending) if pending else ""
+                pending.clear()
+            elif len(pending) > _STREAM_HOLDBACK:
+                cut = len(pending) - _STREAM_HOLDBACK
+                delta_text = llm.tokenizer.decode(pending[:cut])
+                pending = pending[cut:]
+            else:
+                continue
             delta_obj = (
                 ChatCompletionChunkDelta(role="assistant") if first else ChatCompletionChunkDelta()
             )
-            delta_obj.content = delta
+            delta_obj.content = delta_text
             first = False
             chunk = ChatCompletionChunk(
                 id=rid,
@@ -452,6 +510,11 @@ def create_app(llm: LLM, api_key: str | None = None) -> FastAPI:
                 choices=[ChatCompletionChunkChoice(delta=delta_obj, finish_reason=None)],
             )
             yield {"data": chunk.model_dump_json()}
+        # 评审 #6：流式下判死类 finish 追发 error 载荷（状态码已在流开始前
+        # 发出，无法改 5xx；用 error data 行让客户端可识别）
+        if finish in _ERROR_FINISH:
+            yield {"data": json.dumps({"error": {"message": f"request terminated by engine "
+                                                 f"({finish})", "type": "engine_error"}})}
         chunk = ChatCompletionChunk(
             id=rid,
             created=created,
@@ -483,15 +546,21 @@ def create_app(llm: LLM, api_key: str | None = None) -> FastAPI:
         except ValueError as e:
             return _bad_request(str(e))
         rid = engine.submit(ids, sp)
+        if rid is None:  # 评审 #3：排队超限 → 429
+            return JSONResponse(
+                {"error": {"message": "server busy (request queue full)", "type": "rate_limit"}},
+                status_code=429,
+            )
         tokens: list[int] = []
         finish = "stop"
         async for ro in engine.iter_outputs(rid):
             tokens.extend(ro.new_token_ids)
             if ro.finish_reason is not None:
                 finish = ro.finish_reason
-        if finish == "error":
+        if finish in _ERROR_FINISH:  # 评审 #6：判死类统一 5xx
             return JSONResponse(
-                {"error": {"message": "request rejected by engine", "type": "engine_error"}},
+                {"error": {"message": f"request terminated by engine ({finish})",
+                           "type": "engine_error"}},
                 status_code=500,
             )
         return {
