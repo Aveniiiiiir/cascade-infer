@@ -41,7 +41,10 @@ def _one_request(url: str, api_key: str | None, prompt: str, max_tokens: int,
             if not stream:
                 data = json.loads(resp.read())
                 total = time.perf_counter() - t0
-                n = len(data["choices"][0]["message"]["content"].split())
+                # 服务端 usage 是唯一准确口径（按空格分词对中文/代码失真）
+                n = int(data.get("usage", {}).get("completion_tokens") or 0)
+                if n <= 0:
+                    n = len(data["choices"][0]["message"]["content"].split())
                 return total, total, n, 1
             for raw in resp:
                 line = raw.decode("utf-8", errors="replace").strip()
@@ -57,7 +60,9 @@ def _one_request(url: str, api_key: str | None, prompt: str, max_tokens: int,
                 delta = chunk["choices"][0].get("delta", {}).get("content") or ""
                 if delta and ttft < 0:
                     ttft = time.perf_counter() - t0
-                n += max(1, len(delta.split())) if delta else 0
+                # 当前实现每 chunk 对应一个已解码增量（可能含多 token 字符），
+                # 按 chunk 计是流式下最接近的口径；usage 需流式末包（未实现）
+                n += 1 if delta else 0
         total = time.perf_counter() - t0
         return (ttft if ttft >= 0 else total), total, n, 1
     except Exception:
