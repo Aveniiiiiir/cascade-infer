@@ -58,12 +58,25 @@ scripts/gpu_smoke.sh        # 集群冒烟
 | 真实模型 CUDA Graph | **11 档 [1..64] 生产档位，graph ≡ eager bit 级一致** |
 | 真实模型 HTTP serving | 通过（auth/SSE/并发/断连恢复/metrics） |
 
-### 性能（4080 SUPER，V2-Lite bf16，单 seq）
+### 性能（4080 SUPER 32GB，V2-Lite bf16）
+
+单 seq（引擎级）：
 
 | 指标 | eager | CUDA graph | 加速比 |
 |---|---|---|---|
 | TPOT | 64.9ms | **20.3ms** | **3.2x** |
 | TTFT | 0.08s | 0.11s | — |
+
+HTTP 服务（SSE 流式，CUDA graph，`scripts/load_test.py`）：
+
+| 并发 | QPS | tokens/s | TTFT p50 | TPOT p50 |
+|---|---|---|---|---|
+| 8 | 7.7 | 245.9 | 160ms | 21.7ms |
+| 16 | 16.6 | 530.0 | 188ms | 22.5ms |
+| 32 | **23.8** | **762.9** | 226ms | 28.3ms |
+
+- `acceptance_full.sh` 端到端通过（`ACCEPTANCE FULL OK`）
+- 32 并发 / 762.9 tok/s 为 32GB 卡上限；更高并发建议 48GB+
 
 - 分歧全部为 bf16 tie 级数值噪声，非系统性错误；验收以 teacher-forcing 一致率
   与 margin 检查为准（bf16 下 free-running 不保证 token-exact）。
