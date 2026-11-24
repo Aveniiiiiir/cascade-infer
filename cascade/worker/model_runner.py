@@ -151,7 +151,17 @@ class ModelRunner:
         #   中间张量实测 ~150-300MB + CUDA 碎片；第二轮验证暴露）
         runtime = self.engine_cfg.runtime_max_model_len
         rope_reserve = 2 * runtime * self.cfg.qk_rope_head_dim * 20
-        activation_headroom = 512 * 2**20 if self.device.startswith("cuda") else 0  # CPU 测试无 GPU 激活竞争
+        if self.device.startswith("cuda"):
+            # 2026-11-24 压测暴露：CUDA graph 开启时图私有池（11 档共享
+            # pool + 各档位捕获期激活 ≈ 数百 MB）未计入预算——600 块 KV +
+            # 图池在 32GB 卡上把显存吃满，高并发 eager prefill 分配 20MB
+            # 即 OOM → fail_all_inflight 全批判死（实测 384 aborts）。
+            # 图模式 headroom 加倍到 1GB。
+            from cascade.common.env import envs
+
+            activation_headroom = (1024 if envs.CUDAGRAPH else 512) * 2**20
+        else:
+            activation_headroom = 0  # CPU 测试无 GPU 激活竞争
         budget = max(0, budget - rope_reserve - activation_headroom)
         n = derive_num_blocks(budget, self.cfg, cache_cfg.block_size)
         # 实际需求上界：所有并发 seq 的 KV 足迹（含投机余量）
