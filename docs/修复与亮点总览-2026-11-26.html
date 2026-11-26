@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Cascade · 修复与亮点总览（2026-11-26）</title>
+<style>
+  :root{
+    --bg:#070910; --panel:#0e1320; --line:rgba(255,255,255,.09);
+    --text:#e9edf7; --muted:#96a2ba; --cyan:#67e8f9; --indigo:#818cf8; --pink:#f472b6;
+    --grad:linear-gradient(100deg,#67e8f9,#818cf8 55%,#f472b6);
+    --ok:#34f5c5; --warn:#fbbf24; --bad:#fb7185;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth;scroll-padding-top:24px}
+  body{
+    margin:0;background:
+      radial-gradient(900px 500px at 10% -5%,rgba(129,140,248,.14),transparent 60%),
+      radial-gradient(800px 420px at 95% 10%,rgba(244,114,182,.08),transparent 60%),
+      var(--bg);
+    color:var(--text);font:15px/1.75 "Inter","SF Pro Display",-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{display:grid;grid-template-columns:240px minmax(0,1fr);gap:44px;max-width:1180px;margin:0 auto;padding:48px 24px 96px}
+  aside{position:sticky;top:24px;align-self:start;max-height:calc(100vh - 48px);overflow:auto;padding-right:8px}
+  .brand{font-weight:800;font-size:18px;letter-spacing:-.02em;margin-bottom:6px}
+  .brand span{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+  .sub{color:var(--muted);font-size:12.5px;margin-bottom:20px}
+  nav a{display:block;padding:7px 10px;border-radius:8px;color:var(--muted);text-decoration:none;font-size:13.5px;border-left:2px solid transparent}
+  nav a:hover{color:#fff;background:rgba(255,255,255,.05)}
+  nav a.group{border-left-color:rgba(129,140,248,.5);color:#c7d0e5;margin-top:10px}
+  main{min-width:0}
+  header.hero{border:1px solid var(--line);border-radius:20px;padding:34px 34px 28px;background:linear-gradient(180deg,rgba(255,255,255,.055),rgba(255,255,255,.015));margin-bottom:34px}
+  .kicker{font-size:11.5px;letter-spacing:.22em;color:#8ea0c8;font-weight:700}
+  h1{margin:12px 0 10px;font-size:clamp(28px,3.4vw,40px);line-height:1.15;letter-spacing:-.03em;font-weight:800}
+  h1 .g{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+  .lead{color:#aeb9d0;max-width:780px;margin:0}
+  .badges{display:flex;flex-wrap:wrap;gap:8px;margin-top:18px}
+  .badge{font-size:12px;padding:5px 11px;border-radius:999px;border:1px solid var(--line);color:#cdd6ea;background:rgba(255,255,255,.04)}
+  .badge.ok{border-color:rgba(52,245,197,.4);color:#9ff5df}
+  section{margin:38px 0}
+  h2{font-size:22px;letter-spacing:-.02em;margin:0 0 14px;padding-bottom:10px;border-bottom:1px solid var(--line)}
+  h2 .num{font-size:12px;letter-spacing:.14em;color:#7f8db0;margin-right:10px;font-weight:700}
+  h3{font-size:16px;margin:22px 0 8px}
+  p{margin:8px 0;color:#c3ccdf}
+  code{font-family:"JetBrains Mono","SFMono-Regular",Consolas,monospace;font-size:.9em;background:rgba(129,140,248,.12);border:1px solid rgba(129,140,248,.18);padding:1px 6px;border-radius:6px;color:#c9d4ff;white-space:nowrap}
+  pre{background:#0a0e19;border:1px solid var(--line);border-radius:12px;padding:16px 18px;overflow:auto;font-size:13px;line-height:1.7}
+  pre code{background:none;border:0;padding:0;white-space:pre}
+  table{width:100%;border-collapse:separate;border-spacing:0;border:1px solid var(--line);border-radius:12px;overflow:hidden;margin:14px 0;font-size:13.5px}
+  th,td{padding:11px 14px;text-align:left;border-bottom:1px solid rgba(255,255,255,.06);vertical-align:top}
+  th{background:rgba(255,255,255,.04);color:#9fb0d0;font-size:11.5px;letter-spacing:.1em;text-transform:uppercase}
+  tr:last-child td{border-bottom:0}
+  tbody tr:hover{background:rgba(129,140,248,.06)}
+  td code{white-space:nowrap}
+  .ok{color:var(--ok);font-weight:700}
+  .bad{color:var(--bad);font-weight:700}
+  .warn{color:var(--warn);font-weight:700}
+  .hl{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent;font-weight:800}
+  .cards{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin:16px 0}
+  .card{border:1px solid var(--line);border-radius:12px;padding:16px 18px;background:rgba(255,255,255,.03)}
+  .card b{display:block;font-size:13.5px;margin-bottom:4px}
+  .card span{color:var(--muted);font-size:13px}
+  .callout{border-left:3px solid var(--indigo);background:rgba(129,140,248,.07);padding:12px 16px;border-radius:0 10px 10px 0;color:#c9d3e8;font-size:13.5px}
+  ul{margin:8px 0;padding-left:20px;color:#c3ccdf}
+  li{margin:4px 0}
+  footer{margin-top:52px;padding-top:18px;border-top:1px solid var(--line);color:#6e7b95;font-size:12.5px;display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap}
+  @media (max-width:860px){
+    .wrap{grid-template-columns:1fr;gap:20px;padding:24px 16px 64px}
+    main{overflow-x:clip}
+    aside{position:static;max-height:none}
+    nav{display:grid;grid-template-columns:1fr 1fr;gap:2px}
+    header.hero{padding:24px 20px}
+    .cards{grid-template-columns:1fr}
+    table{display:block;overflow-x:auto}
+  }
+  @media print{
+    body{background:#fff;color:#111}
+    aside{display:none}.wrap{display:block;max-width:none;padding:0}
+    header.hero,.card,table{border-color:#ccc;background:#fff}
+    p,li,td{color:#222}.badge{border-color:#ddd;color:#333}
+    h1 .g,.hl,.brand span{color:#333;background:none;-webkit-text-fill-color:#333}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+<aside>
+  <div class="brand">Cascade <span>修复与亮点</span></div>
+  <div class="sub">截至 2026-11-26 · 可打印</div>
+  <nav>
+    <a class="group" href="#deliver">一、最新交付</a>
+    <a href="#ngram">1. n-gram 投机解码</a>
+    <a href="#graph">2. CUDA Graph 多 token</a>
+    <a href="#fp8">3. FP8 KV Cache</a>
+    <a href="#bugs">4. 本轮修复清单</a>
+    <a href="#verify">5. 验证结果</a>
+    <a class="group" href="#web">二、官网落地页</a>
+    <a class="group" href="#history">三、历史修复索引</a>
+    <a class="group" href="#numbers">四、亮点数字</a>
+  </nav>
+</aside>
+
+<main>
+<header class="hero">
+  <div class="kicker">ENGINEERING SUMMARY · 2026-11-26</div>
+  <h1>从审计到量产：<span class="g">修复、优化与亮点</span></h1>
+  <p class="lead">本页汇总项目从 QA 审计、代码评审到真实模型验收过程中发现并修复的问题，
+  以及本轮新增的 n-gram 投机解码、FP8 KV Cache 与 CUDA Graph 多 token 能力。
+  对应 Markdown：<code>docs/修复与亮点总览-2026-11-26.md</code>。</p>
+  <div class="badges">
+    <span class="badge ok">e2e n-gram PASS</span>
+    <span class="badge ok">e2e FP8 KV PASS</span>
+    <span class="badge">GPU 140 passed / 9 skipped</span>
+    <span class="badge">CPU 全绿 · ruff 全绿</span>
+    <span class="badge">762.9 tok/s @ 32 并发</span>
+    <span class="badge">TPOT 3.2×</span>
+  </div>
+</header>
+
+<section id="deliver">
+  <h2><span class="num">01</span>最新一轮交付</h2>
+
+  <h3 id="ngram">1. n-gram / prompt-lookup 无 draft 投机解码</h3>
+  <ul>
+    <li>新增 <code>cascade/sampling/ngram_draft.py</code>：基于序列历史的最长后缀匹配
+      （<code>bytes.rfind</code>，C 速度），无状态实现，不依赖 draft 模型。</li>
+    <li><code>sampling/mtp_verify.py</code> 新增<strong>稀疏草案</strong>路径：
+      one-hot 草案不分配 <code>[K, V]</code> logprobs；接受概率用单点分布的精确
+      <code>min(q[d], p_d)</code>，拒绝残差只在草案列做 <code>relu(q − α·p_d·e_d)</code>。</li>
+    <li>复用既有 MTP 的验证 / 乐观推进回滚 / SO 掩码 / 确定性随机流；
+      贪心下与非投机输出逐 token 一致。</li>
+    <li>开关：<code>CASCADE_NGRAM_DRAFT=1</code>（可调
+      <code>CASCADE_NGRAM_MIN_GRAM / MAX_GRAM / MAX_DRAFT</code>）。</li>
+  </ul>
+
+  <h3 id="graph">2. CUDA Graph 多 token 验证行</h3>
+  <ul>
+    <li><code>CudaGraphRunner</code> 增加 <code>tokens_per_seq = 1+K</code>：档位按 seq 数分档，
+      张量按 <code>seq × v</code> 行捕获，回放按每 seq 行列表写入。</li>
+    <li>MLA 吸收路径新增 <code>uniform_v</code> 分支：全段等长时 q 块元数据全部由 device
+      张量构造（<code>positions[::v] + v</code> 推导段首位置），捕获区间零
+      <code>.item()</code> 同步；varlen / 动态长度自动退化 eager。</li>
+    <li>padding seq 的 block 表每次回放重置为 scratch，杜绝批收缩时垃圾 latent
+      串写活跃序列。</li>
+  </ul>
+
+  <h3 id="fp8">3. FP8 KV Cache（DeepSeek-V3 生产同构）</h3>
+  <div class="cards">
+    <div class="card"><b>布局</b><span>latent c 存 float8(e4m3)，k_rope 保持 bf16，
+      每 128 维一组 fp32 scale。</span></div>
+    <div class="card"><b>体积</b><span>656 B/token/层，bf16 为 1152 B，约 1.76× 压缩。</span></div>
+    <div class="card"><b>实现</b><span>量化在 PyTorch 侧完成（图捕获安全），Triton kernel
+      只搬字节；decode / prefill kernel 内 dequant 后复用同一组 tl.dot。</span></div>
+    <div class="card"><b>开关</b><span><code>--kv-cache-dtype fp8</code> 或
+      <code>CASCADE_KV_DTYPE=fp8</code>。</span></div>
+  </div>
+
+  <h3>精度迭代（真实模型 teacher-forcing）</h3>
+  <table>
+    <thead><tr><th>版本</th><th>explicit 一致率</th><th>结论</th></tr></thead>
+    <tbody>
+      <tr><td>per-token 单 scale</td><td class="bad">627/640 = 0.9797</td>
+        <td>低于 0.985 门槛，放弃</td></tr>
+      <tr><td>每 128 维分组 scale</td><td class="ok">e2e PASS（FP8B_EXIT=0）</td>
+        <td>采用（V3 生产格式）</td></tr>
+    </tbody>
+  </table>
+
+  <h3 id="bugs">4. 本轮捕获并修复的问题</h3>
+  <table>
+    <thead><tr><th>问题</th><th>根因</th><th>修复</th></tr></thead>
+    <tbody>
+      <tr><td>FP8 KV 精度不达门槛</td><td>单 token 一个 absmax scale，outlier 通道误差大</td>
+        <td>改为每 128 维一组 scale</td></tr>
+      <tr><td>CUDA Graph 遇 MTP/n-gram 退化 eager</td><td>图只支持每 seq 1 行</td>
+        <td><code>tokens_per_seq=1+K</code> + <code>uniform_v</code> 图安全路径</td></tr>
+      <tr><td>n-gram 未命中 token 被当作真实草案</td><td>输入侧 0 填充 vs 验证侧 -1 哨兵语义不一致</td>
+        <td>输入侧负值映射 0，验证侧 -1 强拒</td></tr>
+      <tr><td>n-gram <code>max_draft &lt; 引擎 K</code> 时草案整体丢弃</td>
+        <td>返回长度不足 K，验证判为无草案</td><td>尾部补 -1 哨兵到 K</td></tr>
+      <tr><td>FP8 显式路径 CPU 测试崩溃</td>
+        <td><code>index_cpu not implemented for Float8_e4m3fn</code></td>
+        <td>int8 视图 gather 后转回 fp8</td></tr>
+      <tr><td><code>uniform_v</code> 在 ref 路径断言失败</td><td>参考实现只接受显式 segments</td>
+        <td>ref 路径由 <code>seqlens−v</code> 还原 segments</td></tr>
+      <tr><td><code>serve.sh</code> 非交互 SSH 启动失败</td><td>PATH 无 <code>python</code></td>
+        <td>按 <code>PYTHON</code> → <code>python</code> → conda → <code>python3</code> 解析</td></tr>
+    </tbody>
+  </table>
+
+  <h3 id="verify">5. 验证结果</h3>
+  <table>
+    <thead><tr><th>层级</th><th>结果</th></tr></thead>
+    <tbody>
+      <tr><td>本机 <code>pytest tests/cpu</code></td><td class="ok">全绿</td></tr>
+      <tr><td><code>ruff check cascade scripts</code></td><td class="ok">全绿</td></tr>
+      <tr><td>集群 kernel/verify 24 项</td><td class="ok">全过</td></tr>
+      <tr><td>集群 <code>tests/{model,triton_ops,engine}</code></td><td class="ok">140 passed / 9 skipped</td></tr>
+      <tr><td>e2e n-gram（真实 V2-Lite，bf16 KV）</td><td class="ok">PASS</td></tr>
+      <tr><td>e2e FP8 KV（真实 V2-Lite，分组 scale）</td><td class="ok">PASS</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="web">
+  <h2><span class="num">02</span>官网落地页（web/）</h2>
+  <ul>
+    <li>纯静态 <code>index.html</code> + <code>styles.css</code> + <code>app.js</code>，
+      无框架/CDN 依赖；5 张 Unsplash 大图下载到 <code>web/assets/</code>，离线可打开。</li>
+    <li>首屏 3 张图交叉淡入 + Ken Burns + 视差；极光光斑、网格遮罩、
+      渐变文字（<code>background-clip:text</code> 动画）、毛玻璃导航与卡片。</li>
+    <li>滚动体验：IntersectionObserver 渐入（stagger）、数字 count-up、
+      图片 <code>data-src</code> 懒加载 + 滚动距离兜底、<code>prefers-reduced-motion</code>。</li>
+    <li>CDP 真实页面验收（非 iframe）：<span class="ok">29/29</span> 动画触发、
+      计数正确、3 张图按区块懒加载、桌面 1440 与移动 390 横向溢出均为 <span class="ok">0</span>。</li>
+  </ul>
+  <div class="callout">预览：<code>python -m http.server 8088</code>（在 <code>web/</code> 下）
+    然后打开 <code>http://127.0.0.1:8088</code>；也可直接双击 <code>web/index.html</code>。</div>
+</section>
+
+<section id="history">
+  <h2><span class="num">03</span>历史关键修复索引（已合入 master）</h2>
+  <table>
+    <thead><tr><th>提交</th><th>内容</th></tr></thead>
+    <tbody>
+      <tr><td><code>7ae750a</code></td><td>代码评审高危：图回放 padding 行 KV 串写 + 调度 trace 无界泄漏</td></tr>
+      <tr><td><code>0959b83</code> / <code>7dae741</code></td><td>acceptance 图模式 OOM；CUDA graph 激活 headroom 加倍到 1GB</td></tr>
+      <tr><td><code>427ad08</code> / <code>8141d6f</code></td><td>acceptance <code>curl｜grep -q</code> SIGPIPE 竞态；cleanup <code>wait</code> 143 触发 set -e</td></tr>
+      <tr><td><code>4de44be</code></td><td>e2e margin 检查 <code>&lt;</code> 改 <code>&lt;=</code>（0.25 恰为 tie 级边界）</td></tr>
+      <tr><td><code>0e1272b</code></td><td>批不变跨形状 xfail 改非严格（bf16 噪声决定偶发通过）</td></tr>
+      <tr><td><code>6dea610</code> / <code>50240b6</code></td><td>HTTP 资源上限 413、判死语义、流式增量解码、鉴权常数时间</td></tr>
+      <tr><td><code>2312f1a</code></td><td>压测 token 计数改用服务端 usage / 流式 chunk</td></tr>
+      <tr><td><code>91a8e3e</code></td><td>标准服务启动脚本（detached + pid/日志）</td></tr>
+    </tbody>
+  </table>
+  <p>更完整的逐条记录：<code>docs/cascade-infer-问题与修复报告.md</code>、
+    <code>docs/全项目QA审计与修复-2026-11-18.md</code>、
+    <code>docs/验证最终结果-2026-11-23.md</code>、
+    <code>docs/HTTP压测与最终验收-2026-11-24.md</code>、
+    <code>docs/优化-n-gram与FP8-KV-2026-11-24.md</code>。</p>
+</section>
+
+<section id="numbers">
+  <h2><span class="num">04</span>可复现的亮点数字</h2>
+  <div class="cards">
+    <div class="card"><b class="hl">20.3 ms</b><span>TPOT · CUDA Graph；eager 64.9ms，<b>3.2×</b></span></div>
+    <div class="card"><b class="hl">762.9 tok/s</b><span>HTTP 32 并发，TPOT p50 28.3ms，零 abort / 零 step error</span></div>
+    <div class="card"><b class="hl">98.96%</b><span>真实 V2-Lite teacher-forcing 逐位置 argmax 一致率</span></div>
+    <div class="card"><b class="hl">656 B</b><span>FP8 KV / token / 层（1152 → 656，1.76× 压缩）</span></div>
+    <div class="card"><b class="hl">11 档</b><span>CUDA Graph [1..64]，graph ≡ eager bit 级一致</span></div>
+    <div class="card"><b class="hl">0 训练</b><span>n-gram 投机解码：无 draft 模型，输出逐 token 无损</span></div>
+  </div>
+</section>
+
+<footer>
+  <span>Cascade · 生产级 LLM 推理引擎</span>
+  <span>对应 Markdown：docs/修复与亮点总览-2026-11-26.md</span>
+</footer>
+</main>
+</div>
+</body>
+</html>
