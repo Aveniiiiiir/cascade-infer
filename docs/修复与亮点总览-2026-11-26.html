@@ -718,12 +718,12 @@ tests/e2e/test_v2_lite_greedy.py     | 69 +++++++++++++++++++++++-------------
   <summary><span class="doc-title">Cascade 推理引擎上线配置与灰度清单</span><span class="doc-meta">3.5 KB · Markdown 原文</span></summary>
   <div class="doc-body">
 <h4>Cascade 推理引擎上线配置与灰度清单</h4>
-<p>实例：<code>c4ae4b8669-a9956a39</code>（4080 SUPER 32GB，Ubuntu 22.04 容器） 验收代码：<code>feat/ngram-fp8-kv-web</code> @ <code>327b3b4</code></p>
+<p>实例：<code>c4ae4b8669-a9956a39</code>（4080 SUPER 32GB，Ubuntu 22.04 容器） 环境：driver 595.71.05 · torch 2.7.0+cu128 · transformers 4.57.6 验收代码：<code>feat/ngram-fp8-kv-web</code> @ <code>327b3b4</code></p>
 <h5>1. 配置矩阵</h5>
 <table><thead><tr><th>文件</th><th>用途</th></tr></thead><tbody><tr><td><code>deploy/systemd/cascade-infer.service</code></td><td>标准 Linux systemd 服务（自动拉起、重启、日志轮转）</td></tr><tr><td><code>deploy/supervisor/cascade-infer.conf</code></td><td>容器 supervisord 等效守护配置</td></tr><tr><td><code>deploy/nginx/cascade.conf</code></td><td>内网 HTTP 反代、SSE、限流、超时、安全响应头</td></tr><tr><td><code>deploy/alerting/cascade.rules.yml</code></td><td>Prometheus 告警规则：不可用、错误率、吞吐、延迟、显存</td></tr><tr><td><code>deploy/env.example</code></td><td>部署参数示例，无真实凭据</td></tr><tr><td><code>scripts/production_gate.sh</code></td><td>生产探活、鉴权、推理、指标与压测门禁</td></tr></tbody></table>
 <p><strong>注意</strong>：该实例 PID 1 是 bash，由 supervisord 托管，不能使用 systemd。 systemd 文件用于标准主机；此实例实际部署 supervisor 配置。</p>
 <h5>2. 验收门禁</h5>
-<ul><li>[x] 精确 release tree 跑完 <code>acceptance_full.sh</code>，日志含 <code>ACCEPTANCE FULL OK</code>。</li><li>[x] CPU 全绿；GPU <code>model/triton_ops/engine</code> 全绿；真实 V2-Lite e2e 通过。</li><li>[x] HTTP 生产探活：无 key 401、合法 key 200、chat 200、<code>/metrics</code> 200。</li><li>[x] 8/16/32 并发 SSE 压测：零错误，记录 QPS / tokens/s / TTFT / TPOT。</li><li>[x] n-gram 和 FP8 各做独立 e2e；混合配置只作为可选实验，不默认上线。</li><li>[x] 服务重启恢复、反代转发、SSE 不缓冲、限流返回 429。</li><li>[ ] 保存 commit、GPU、驱动、PyTorch、测试与压测结果。</li></ul>
+<ul><li>[x] 精确 release tree 跑完 <code>acceptance_full.sh</code>，日志含 <code>ACCEPTANCE FULL OK</code>。</li><li>[x] CPU 全绿；GPU <code>model/triton_ops/engine</code> 全绿；真实 V2-Lite e2e 通过。</li><li>[x] HTTP 生产探活：无 key 401、合法 key 200、chat 200、<code>/metrics</code> 200。</li><li>[x] 8/16/32 并发 SSE 压测：零错误，记录 QPS / tokens/s / TTFT / TPOT。</li><li>[x] n-gram 和 FP8 各做独立 e2e；混合配置只作为可选实验，不默认上线。</li><li>[x] 服务重启恢复、反代转发、SSE 不缓冲、限流返回 429。</li><li>[x] 保存 commit、GPU、驱动、PyTorch、测试与压测结果。</li></ul>
 <h5>3. 灰度步骤</h5>
 <ol><li><strong>冻结</strong>：只使用通过验收的 commit；不直接部署 master 最新提交。</li><li><strong>单实例</strong>：bf16、<code>MAX_LEN=4096</code>、<code>MAX_SEQS=24</code>、32GB 卡，不默认开 n-gram/FP8。</li><li><strong>内网</strong>：应用只监听 <code>127.0.0.1:8000</code>；业务通过 nginx <code>8080</code> 访问。</li><li><strong>密钥</strong>：真实 API key 写在实例 root-only 环境文件，不提交仓库、不写公开文档。</li><li><strong>反代</strong>：启用安全响应头、请求体 10MB 上限、连接/请求限流、SSE <code>proxy_buffering off</code>。</li><li><strong>守护</strong>：容器用 supervisor；标准主机用 systemd。健康检查失败触发运维告警。</li><li><strong>灰度</strong>：先内部 smoke → 1% 内部真实请求 → 5% 观察 24–48h → 逐级放量。</li><li><strong>指标</strong>：请求量、5xx/判死率、TTFT/TPOT、tokens/s、GPU 利用率/显存、进程重启次数。</li><li><strong>容量</strong>：不得把 32 并发当永久上限；按真实 prompt 长度和输出长度重新确定。</li><li><strong>回滚</strong>：停止新实例，恢复上一 commit/配置；健康检查失败不继续放量。</li></ol>
 <h5>4. 放量/回滚阈值</h5>
@@ -733,10 +733,10 @@ tests/e2e/test_v2_lite_greedy.py     | 69 +++++++++++++++++++++++-------------
   </div>
 </details>
 <details class="doc" id="doc-上线验收与部署-2026-11-26">
-  <summary><span class="doc-title">上线验收与部署（2026-11-26）</span><span class="doc-meta">4.0 KB · Markdown 原文</span></summary>
+  <summary><span class="doc-title">上线验收与部署（2026-11-26）</span><span class="doc-meta">4.1 KB · Markdown 原文</span></summary>
   <div class="doc-body">
 <h4>上线验收与部署（2026-11-26）</h4>
-<p>实例：<code>c4ae4b8669-a9956a39</code>（RTX 4080 SUPER 32GB，Ubuntu 22.04 容器） 验收代码：<code>feat/ngram-fp8-kv-web</code> @ <code>327b3b4</code>（release tree 精确归档部署）</p>
+<p>实例：<code>c4ae4b8669-a9956a39</code>（RTX 4080 SUPER 32GB，Ubuntu 22.04 容器） 验收代码：<code>feat/ngram-fp8-kv-web</code> @ <code>327b3b4</code>（release tree 精确归档部署） 运行环境：NVIDIA RTX 4080 SUPER · driver 595.71.05 · torch 2.7.0+cu128 · transformers 4.57.6</p>
 <h5>1. 验收结果</h5>
 <table><thead><tr><th>项</th><th>结果</th></tr></thead><tbody><tr><td>精确 release tree <code>acceptance_full.sh</code></td><td><strong>PASS（ACCEPTANCE FULL OK）</strong></td></tr><tr><td>CPU 测试</td><td>通过（acceptance 第一阶段）</td></tr><tr><td><code>tests/model + tests/triton_ops + tests/engine</code></td><td>通过（140 passed / 9 skipped 口径）</td></tr><tr><td><code>tests/e2e</code>（真实 V2-Lite）</td><td>通过（本轮日志）</td></tr><tr><td>CLI 冒烟</td><td>PASS（两个 prompt 均输出）</td></tr><tr><td>HTTP serving 冒烟</td><td>PASS（/v1/models 200、chat/completions 200）</td></tr><tr><td>生产门禁 <code>production_gate.sh</code></td><td><strong>PASS（GATE OK）</strong></td></tr><tr><td>8/16/32 并发压测</td><td><strong>PASS（0 errors）</strong></td></tr></tbody></table>
 <h6>压测（<code>MAX_SEQS=24</code>，nginx :8080，SSE）</h6>
@@ -775,6 +775,9 @@ GPU（V2-Lite bf16，MAX_LEN=4096，MAX_SEQS=24）</code></pre>
   <p>实例 <code>c4ae4b8669-a9956a39</code>（RTX 4080 SUPER 32GB，Ubuntu 22.04 容器），
   精确 release tree <code>327b3b4</code>。宿主当前负载较高（load ≈ 30+），
   单次真实模型加载约 10–15 分钟，以下结果按本轮实际日志记录。</p>
+  <p>运行环境：driver <code>595.71.05</code> · torch <code>2.7.0+cu128</code> ·
+  transformers <code>4.57.6</code> · 验收 commit <code>327b3b4</code>，
+  部署记录 <code>dd34a7f</code>。</p>
 
   <div class="cards">
     <div class="card"><b>验收版本</b><span><code>feat/ngram-fp8-kv-web</code> @ <code>327b3b4</code>，
