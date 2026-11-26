@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Cascade — 生产级 LLM 推理引擎</title>
+<meta name="description" content="Cascade：PyTorch + Triton 自研的 LLM 推理引擎。分页 KV、连续批处理、MTP / n-gram 投机解码、FP8 KV、CUDA Graph，DeepSeek-V2-Lite 全链路量产验证。" />
+<link rel="preload" as="image" href="assets/hero.jpg" />
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<div class="scroll-progress" id="scrollProgress"></div>
+
+<!-- ======================= NAV ======================= -->
+<header class="nav" id="nav">
+  <a class="brand" href="#top">
+    <span class="brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 32 32" fill="none"><path d="M4 22 12 6l6 12 4-8 6 12" stroke="url(#g1)" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/><defs><linearGradient id="g1" x1="0" y1="0" x2="32" y2="32"><stop stop-color="#67e8f9"/><stop offset=".55" stop-color="#818cf8"/><stop offset="1" stop-color="#f472b6"/></linearGradient></defs></svg>
+    </span>
+    <span class="brand-text">Cascade</span>
+  </a>
+  <nav class="nav-links" aria-label="主导航">
+    <a href="#performance">性能</a>
+    <a href="#capabilities">能力</a>
+    <a href="#architecture">架构</a>
+    <a href="#benchmarks">实测</a>
+    <a href="#quickstart">快速开始</a>
+  </nav>
+  <div class="nav-actions">
+    <a class="btn btn-ghost" href="https://github.com/deepseek-ai/DeepInfer" target="_blank" rel="noreferrer">设计蓝本</a>
+    <a class="btn btn-primary" href="#quickstart">立即部署</a>
+  </div>
+  <button class="nav-toggle" id="navToggle" aria-label="打开菜单" aria-expanded="false">
+    <span></span><span></span>
+  </button>
+</header>
+
+<main id="top">
+  <!-- ======================= HERO ======================= -->
+  <section class="hero" id="hero">
+    <div class="hero-media">
+      <div class="hero-slide is-active" data-bg="assets/hero.jpg"></div>
+      <div class="hero-slide" data-bg="assets/cyber.jpg"></div>
+      <div class="hero-slide" data-bg="assets/earth.jpg"></div>
+    </div>
+    <div class="hero-grid" aria-hidden="true"></div>
+    <div class="orb orb-a" data-parallax="0.18" aria-hidden="true"></div>
+    <div class="orb orb-b" data-parallax="-0.12" aria-hidden="true"></div>
+    <div class="orb orb-c" data-parallax="0.08" aria-hidden="true"></div>
+
+    <div class="hero-inner">
+      <div class="pill reveal in">
+        <span class="pill-dot"></span>
+        DeepSeek-V2-Lite · 全链路量产验证
+      </div>
+      <h1 class="hero-title reveal in">
+        <span class="line">让每一次推理</span>
+        <span class="line gradient-text">都跑在极限上</span>
+      </h1>
+      <p class="hero-sub reveal in" style="--d:.1s">
+        PyTorch + Triton 自研算子，分页 KV 与连续批处理打底，MTP / n-gram 投机解码、
+        FP8 KV 与 CUDA Graph 叠加加速。OpenAI 兼容，单卡即可上线。
+      </p>
+      <div class="hero-cta reveal in" style="--d:.18s">
+        <a class="btn btn-primary btn-lg" href="#quickstart">三行命令启动</a>
+        <a class="btn btn-glass btn-lg" href="#performance">查看实测数据</a>
+      </div>
+
+      <div class="hero-stats reveal in" style="--d:.26s">
+        <div class="stat">
+          <div class="stat-num gradient-text"><span class="count" data-to="762.9" data-dec="1">0</span><small>tok/s</small></div>
+          <div class="stat-label">32 并发持续吞吐</div>
+        </div>
+        <div class="stat">
+          <div class="stat-num gradient-text"><span class="count" data-to="3.2" data-dec="1">0</span><small>×</small></div>
+          <div class="stat-label">CUDA Graph 加速</div>
+        </div>
+        <div class="stat">
+          <div class="stat-num gradient-text"><span class="count" data-to="98.96" data-dec="2">0</span><small>%</small></div>
+          <div class="stat-label">逐位置 argmax 一致率</div>
+        </div>
+        <div class="stat">
+          <div class="stat-num gradient-text"><span class="count" data-to="656" data-dec="0">0</span><small>B</small></div>
+          <div class="stat-label">FP8 KV / token / 层</div>
+        </div>
+      </div>
+    </div>
+
+    <a class="scroll-hint" href="#performance" aria-label="向下滚动">
+      <span class="mouse"><span class="wheel"></span></span>
+      <span>向下滚动</span>
+    </a>
+  </section>
+
+  <!-- ======================= MARQUEE ======================= -->
+  <div class="marquee" aria-hidden="true">
+    <div class="marquee-track">
+      <span>CUDA Graph</span><i>•</i><span>PagedAttention</span><i>•</i><span>Continuous Batching</span><i>•</i>
+      <span>MTP Speculative</span><i>•</i><span>n-gram Draft</span><i>•</i><span>FP8 KV Cache</span><i>•</i>
+      <span>MoE Fused Kernel</span><i>•</i><span>xgrammar</span><i>•</i><span>Prefix Cache</span><i>•</i>
+      <span>CUDA Graph</span><i>•</i><span>PagedAttention</span><i>•</i><span>Continuous Batching</span><i>•</i>
+      <span>MTP Speculative</span><i>•</i><span>n-gram Draft</span><i>•</i><span>FP8 KV Cache</span><i>•</i>
+      <span>MoE Fused Kernel</span><i>•</i><span>xgrammar</span><i>•</i><span>Prefix Cache</span><i>•</i>
+    </div>
+  </div>
+
+  <!-- ======================= PERFORMANCE ======================= -->
+  <section class="section" id="performance">
+    <div class="section-head reveal">
+      <span class="kicker">PERFORMANCE</span>
+      <h2 class="section-title">把每一步 <span class="gradient-text">压到极限</span></h2>
+      <p class="section-sub">4080 SUPER 32GB · DeepSeek-V2-Lite bf16 · 真实 HTTP 压测</p>
+    </div>
+
+    <div class="metric-grid">
+      <article class="metric-card reveal" style="--d:.02s">
+        <div class="metric-value gradient-text"><span class="count" data-to="20.3" data-dec="1">0</span><small>ms</small></div>
+        <h3>TPOT · CUDA Graph</h3>
+        <p>从 eager 64.9ms 降至 20.3ms，11 个生产档位全档共享显存池，图内回放与 eager bit 级一致。</p>
+        <div class="bar"><span style="--w:32%"></span></div>
+      </article>
+      <article class="metric-card reveal" style="--d:.08s">
+        <div class="metric-value gradient-text"><span class="count" data-to="762.9" data-dec="1">0</span><small>tok/s</small></div>
+        <h3>32 并发持续吞吐</h3>
+        <p>SSE 流式、零 abort、零 step error；更高并发建议 48GB+ 显存。</p>
+        <div class="bar"><span style="--w:100%"></span></div>
+      </article>
+      <article class="metric-card reveal" style="--d:.14s">
+        <div class="metric-value gradient-text"><span class="count" data-to="1.76" data-dec="2">0</span><small>×</small></div>
+        <h3>FP8 KV 压缩</h3>
+        <p>latent c 走 FP8(e4m3)、rope 保持 bf16、每 128 维一组 scale，KV 从 1152B 降到 656B。</p>
+        <div class="bar"><span style="--w:57%"></span></div>
+      </article>
+      <article class="metric-card reveal" style="--d:.2s">
+        <div class="metric-value gradient-text"><span class="count" data-to="11" data-dec="0">0</span><small>档</small></div>
+        <h3>图捕获档位</h3>
+        <p>[1,2,4,8,16,24,32,40,48,56,64]，按批大小自动选择，捕获 5s 完成。</p>
+        <div class="bar"><span style="--w:70%"></span></div>
+      </article>
+    </div>
+  </section>
+
+  <!-- ======================= CAPABILITIES ======================= -->
+  <section class="section section-tinted" id="capabilities">
+    <div class="section-head reveal">
+      <span class="kicker">CAPABILITIES</span>
+      <h2 class="section-title">一整套 <span class="gradient-text">生产级底座</span></h2>
+      <p class="section-sub">从调度到算子全栈自研，不绑定专有硬件。</p>
+    </div>
+
+    <div class="card-grid">
+      <article class="feature-card reveal" style="--d:.02s">
+        <div class="feature-icon">
+          <svg viewBox="0 0 24 24" fill="none"><path d="M4 7h16M4 12h10M4 17h13" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        </div>
+        <h3>连续批处理 + Chunked Prefill</h3>
+        <p>decode 与 prefill 混合 varlen 批同步推进，前缀缓存 block 哈希链 + LRU + COW。</p>
+      </article>
+      <article class="feature-card reveal" style="--d:.08s">
+        <div class="feature-icon">
+          <svg viewBox="0 0 24 24" fill="none"><rect x="4" y="4" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.8"/><rect x="13" y="4" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.8"/><rect x="4" y="13" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.8"/><rect x="13" y="13" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.8"/></svg>
+        </div>
+        <h3>分页 KV + 前缀复用</h3>
+        <p>block 表跨层共享，block id 0 保留；抢占重算命中缓存，长会话零重复计算。</p>
+      </article>
+      <article class="feature-card reveal" style="--d:.14s">
+        <div class="feature-icon">
+          <svg viewBox="0 0 24 24" fill="none"><path d="M12 3v18M3 12h18" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="12" cy="12" r="4.5" stroke="currentColor" stroke-width="1.8"/></svg>
+        </div>
+        <h3>MTP + n-gram 投机解码</h3>
+        <p>采样式拒绝采样保证输出无损；n-gram 无需 draft 模型，复用验证/回滚管线。</p>
+      </article>
+      <article class="feature-card reveal" style="--d:.2s">
+        <div class="feature-icon">
+          <svg viewBox="0 0 24 24" fill="none"><path d="M5 19V9m7 10V5m7 14v-7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M3 19h18" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        </div>
+        <h3>FP8 KV Cache</h3>
+        <p>DeepSeek-V3 同构布局：c FP8 + rope bf16 + 分组 scale，同显存装下更多并发。</p>
+      </article>
+      <article class="feature-card reveal" style="--d:.26s">
+        <div class="feature-icon">
+          <svg viewBox="0 0 24 24" fill="none"><path d="m8 9-4 3 4 3m8-6 4 3-4 3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><path d="m13 6-2 12" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        </div>
+        <h3>结构化输出</h3>
+        <p>xgrammar 的 regex / JSON schema / EBNF，异步编译 + 失败隔离，不阻塞调度热路径。</p>
+      </article>
+      <article class="feature-card reveal" style="--d:.32s">
+        <div class="feature-icon">
+          <svg viewBox="0 0 24 24" fill="none"><path d="M12 3 4 7v10l8 4 8-4V7l-8-4Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="m4 7 8 4 8-4M12 11v10" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>
+        </div>
+        <h3>OpenAI 兼容服务</h3>
+        <p>SSE 流式、/v1/completions、/metrics、Bearer 鉴权、断连恢复，一套接口接入业务。</p>
+      </article>
+    </div>
+  </section>
+
+  <!-- ======================= ARCHITECTURE ======================= -->
+  <section class="section arch" id="architecture">
+    <div class="arch-copy">
+      <div class="section-head align-left reveal">
+        <span class="kicker">ARCHITECTURE</span>
+        <h2 class="section-title">同步序引擎，<br /><span class="gradient-text">每一步都可解释</span></h2>
+        <p class="section-sub">
+          调度、组批、前向、采样、提交在一帧内闭环。CUDA Graph 只捕获
+          forward_hidden，lm_head 留在图外；padding 行恒指 scratch 块，
+          批收缩也不会污染活跃序列。
+        </p>
+      </div>
+      <ul class="arch-list">
+        <li class="reveal" style="--d:.05s">
+          <span class="arch-idx">01</span>
+          <div><h4>Scheduler</h4><p>FCFS prefill + LCFS decode，抢占重算与 NEVER 路径防活锁。</p></div>
+        </li>
+        <li class="reveal" style="--d:.12s">
+          <span class="arch-idx">02</span>
+          <div><h4>BlockManager / PrefixCache</h4><p>block id 1..N，容量守卫恒用 capacity（扣除 reserved）。</p></div>
+        </li>
+        <li class="reveal" style="--d:.19s">
+          <span class="arch-idx">03</span>
+          <div><h4>ModelRunner</h4><p>MLA 吸收路径 + fused MoE + 分页注意力 Triton kernel。</p></div>
+        </li>
+        <li class="reveal" style="--d:.26s">
+          <span class="arch-idx">04</span>
+          <div><h4>Engine Loop</h4><p>失败隔离与回执：异常步只判死本批，引擎继续服务。</p></div>
+        </li>
+      </ul>
+    </div>
+    <div class="arch-visual reveal" style="--d:.1s">
+      <div class="media-frame">
+        <img class="lazy" data-src="assets/chip.jpg" alt="芯片与算力" width="1600" height="1067" />
+        <div class="media-shine" aria-hidden="true"></div>
+        <div class="float-card float-a">
+          <span>KV 布局</span><strong>[27, 335, 64, 512]</strong>
+        </div>
+        <div class="float-card float-b">
+          <span>图回放</span><strong>graph ≡ eager</strong>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= BENCHMARKS ======================= -->
+  <section class="section section-tinted" id="benchmarks">
+    <div class="section-head reveal">
+      <span class="kicker">BENCHMARKS</span>
+      <h2 class="section-title">真实负载下的 <span class="gradient-text">每一条曲线</span></h2>
+    </div>
+
+    <div class="bench-wrap reveal">
+      <table class="bench-table">
+        <thead>
+          <tr><th>并发</th><th>QPS</th><th>tokens/s</th><th>TTFT p50</th><th>TPOT p50</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>8</td><td>7.7</td><td class="hi">245.9</td><td>160 ms</td><td>21.7 ms</td></tr>
+          <tr><td>16</td><td>16.6</td><td class="hi">530.0</td><td>188 ms</td><td>22.5 ms</td></tr>
+          <tr><td>32</td><td>23.8</td><td class="hi">762.9</td><td>226 ms</td><td>28.3 ms</td></tr>
+        </tbody>
+      </table>
+      <div class="bench-note">
+        SSE 流式 · CUDA Graph · 零 abort / 零 step error · 4080 SUPER 32GB
+      </div>
+    </div>
+
+    <div class="bench-visual reveal" style="--d:.08s">
+      <div class="media-frame wide">
+        <img class="lazy" data-src="assets/dc.jpg" alt="数据中心" width="1600" height="1067" />
+        <div class="overlay-text">
+          <span class="kicker">SINGLE GPU</span>
+          <p class="gradient-text">32 并发 · 762.9 tok/s</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= QUICKSTART ======================= -->
+  <section class="section" id="quickstart">
+    <div class="section-head reveal">
+      <span class="kicker">QUICKSTART</span>
+      <h2 class="section-title">三行命令，<span class="gradient-text">跑起来</span></h2>
+    </div>
+
+    <div class="code-shell reveal">
+      <div class="code-tabs" role="tablist">
+        <button class="code-tab is-active" data-tab="serve" role="tab" aria-selected="true">HTTP 服务</button>
+        <button class="code-tab" data-tab="python" role="tab" aria-selected="false">离线推理</button>
+        <button class="code-tab" data-tab="fp8" role="tab" aria-selected="false">FP8 KV</button>
+      </div>
+      <div class="code-body">
+<pre class="code-pane is-active" data-pane="serve"><code><span class="c"># 安装 + 启动（模型加载 7-10 分钟）</span>
+pip install -e <span class="s">".[dev,so]"</span>
+
+CASCADE_MODEL=/models/DeepSeek-V2-Lite <span class="a">\</span>
+  API_KEY=sk-cascade <span class="a">\</span>
+  bash scripts/serve.sh
+
+<span class="c"># 就绪后直接走 OpenAI 接口</span>
+curl http://localhost:8000/v1/completions <span class="a">\</span>
+  -H <span class="s">"Authorization: Bearer sk-cascade"</span> <span class="a">\</span>
+  -d <span class="s">'{"model":"cascade","prompt":"你好","max_tokens":64}'</span></code></pre>
+<pre class="code-pane" data-pane="python"><code><span class="k">from</span> cascade.entrypoints.llm <span class="k">import</span> LLM
+
+llm = LLM(<span class="s">"/models/DeepSeek-V2-Lite"</span>, max_model_len=<span class="n">4096</span>)
+<span class="k">print</span>(llm.generate([<span class="s">"用三句话解释 MLA 注意力"</span>], max_tokens=<span class="n">128</span>)[<span class="n">0</span>])</code></pre>
+<pre class="code-pane" data-pane="fp8"><code><span class="c"># FP8 KV：c 走 e4m3，rope 保持 bf16，每 128 维一组 scale</span>
+CASCADE_KV_DTYPE=fp8 <span class="a">\</span>
+  CASCADE_MODEL=/models/DeepSeek-V2-Lite <span class="a">\</span>
+  bash scripts/serve.sh
+
+<span class="c"># 无 draft 模型的 n-gram 投机解码</span>
+CASCADE_NGRAM_DRAFT=<span class="n">1</span> bash scripts/serve.sh</code></pre>
+      </div>
+      <button class="copy-btn" id="copyBtn" aria-label="复制代码">复制</button>
+    </div>
+  </section>
+
+  <!-- ======================= FINAL CTA ======================= -->
+  <section class="cta-final" id="cta">
+    <div class="cta-media"><img class="lazy" data-src="assets/earth.jpg" alt="" aria-hidden="true" /></div>
+    <div class="cta-glow" aria-hidden="true"></div>
+    <div class="cta-inner reveal">
+      <h2>下一次上线，<span class="gradient-text">从 Cascade 开始</span></h2>
+      <p>单卡可跑、接口兼容、每一步都可对拍。把推理底座交给它，业务只管发请求。</p>
+      <div class="hero-cta">
+        <a class="btn btn-primary btn-lg" href="#quickstart">开始部署</a>
+        <a class="btn btn-glass btn-lg" href="#performance">回看性能</a>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="footer">
+  <div class="footer-inner">
+    <div class="footer-brand">
+      <span class="brand-mark small" aria-hidden="true">
+        <svg viewBox="0 0 32 32" fill="none"><path d="M4 22 12 6l6 12 4-8 6 12" stroke="url(#g2)" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/><defs><linearGradient id="g2" x1="0" y1="0" x2="32" y2="32"><stop stop-color="#67e8f9"/><stop offset=".55" stop-color="#818cf8"/><stop offset="1" stop-color="#f472b6"/></linearGradient></defs></svg>
+      </span>
+      <span class="gradient-text footer-logo">Cascade</span>
+      <p>生产级 LLM 推理引擎 · PyTorch + Triton</p>
+    </div>
+    <div class="footer-links">
+      <a href="#performance">性能</a>
+      <a href="#capabilities">能力</a>
+      <a href="#architecture">架构</a>
+      <a href="#quickstart">快速开始</a>
+    </div>
+    <div class="footer-meta">
+      <p>Images · Unsplash</p>
+      <p>© 2026 Cascade Infer</p>
+    </div>
+  </div>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>

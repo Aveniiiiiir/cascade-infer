@@ -8,3 +8,6 @@ dist/
 .ruff_cache/
 TRITON_CACHE_DIR/
 golden/*.actual.txt
+
+# 本地前端验收产物（截图/CDP 脚本）
+web/_debug/
