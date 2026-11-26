@@ -1,0 +1,24 @@
+[Unit]
+Description=Cascade LLM inference service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/cascade-infer
+EnvironmentFile=/etc/cascade-infer/env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/root/miniconda3/bin/python -m cascade.entrypoints.http.server --model ${CASCADE_MODEL} --host 127.0.0.1 --port 8000 --max-model-len 4096 --max-num-seqs ${MAX_SEQS} --api-key ${CASCADE_API_KEY}
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=1200
+TimeoutStopSec=60
+KillSignal=SIGTERM
+StandardOutput=append:/var/log/cascade-infer/service.log
+StandardError=append:/var/log/cascade-infer/service.log
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

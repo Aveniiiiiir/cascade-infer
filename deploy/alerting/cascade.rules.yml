@@ -1,0 +1,53 @@
+groups:
+  - name: cascade-availability
+    rules:
+      - alert: CascadeDown
+        expr: up{job="cascade-infer"} == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: Cascade 实例不可用
+          description: "{{ $labels.instance }} 已连续 1 分钟不可达，检查进程、GPU 与反代。"
+
+      - alert: CascadeDownExtended
+        expr: up{job="cascade-infer"} == 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: Cascade 持续不可用，按灰度清单回滚
+          description: "{{ $labels.instance }} 已连续 5 分钟不可达，停止放量并执行回滚。"
+
+      - alert: CascadeHighErrorRate
+        expr: |
+          sum(rate(cascade_requests_total{finish=~"error|abort|preempt|so_failed|ignored"}[5m]))
+          / clamp_min(sum(rate(cascade_requests_total[5m])), 0.001) > 0.02
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: Cascade 判死/错误比例超过 2%
+          description: "连续 5 分钟错误率超过 2%，禁止放量。"
+
+      - alert: CascadeEngineStepError
+        expr: increase(cascade_engine_step_errors_total[5m]) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: 引擎步异常（全批 fail_all_inflight）
+          description: "5 分钟内出现引擎步异常，属于阻断放量事件。"
+
+      - alert: CascadeQueueBacklog
+        expr: cascade_waiting_seqs{job="cascade-infer"} > 32
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: 排队序列持续偏高
+          description: "等待队列超过 32 持续 10 分钟，检查并发与 KV 容量。"
+
+      - alert: CascadeHighGPUMemory
+        expr: |
+          DCGM_FI_DEV_FB_USED
+          / (DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE) > 0.95
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: GPU 显存超过 95%
+          description: "{{ $labels.gpu }} 显存接近上限，降低 MAX_SEQS 或回滚。"

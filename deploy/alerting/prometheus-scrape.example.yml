@@ -1,0 +1,17 @@
+# Prometheus 抓取示例；密钥通过 root-only token 文件注入，不写入仓库。
+scrape_configs:
+  - job_name: cascade-infer
+    metrics_path: /metrics
+    scheme: http
+    bearer_token_file: /etc/cascade-infer/prometheus-token
+    static_configs:
+      - targets: ["127.0.0.1:8000"]
+        labels:
+          service: cascade-infer
+          env: gray
+
+  # 若使用 DCGM Exporter，请把 GPU 指标 job 命名保留为 dcgm，
+  # 告警规则中的 DCGM_FI_DEV_FB_* 依赖该指标族。
+  - job_name: dcgm
+    static_configs:
+      - targets: ["127.0.0.1:9400"]

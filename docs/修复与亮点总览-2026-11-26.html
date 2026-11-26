@@ -105,6 +105,15 @@
   .doc-body p,.doc-body li{font-size:13.5px}
   .doc-body table{font-size:12.5px}
   .doc-body pre{font-size:12px}
+  .topo{display:flex;align-items:stretch;gap:10px;flex-wrap:wrap;margin:18px 0}
+  .topo .node{flex:1 1 180px;border:1px solid var(--line);border-radius:12px;padding:14px 16px;background:rgba(255,255,255,.03)}
+  .topo .node b{display:block;font-size:13.5px;margin-bottom:4px}
+  .topo .node span{color:var(--muted);font-size:12.5px}
+  .topo .arrow{align-self:center;color:#7f8db0;font-weight:700}
+  .status{font-weight:700}
+  .status.ok{color:var(--ok)}
+  .status.pending{color:var(--warn)}
+  .status.bad{color:var(--bad)}
   @media (max-width:860px){
     .wrap{padding:72px 16px 64px}
     body.toc-open .wrap{padding-left:16px}
@@ -153,6 +162,7 @@
     <a href="#lib-audit">审计与评审</a>
     <a href="#lib-plan">规划与路线</a>
     <!-- DOC_NAV_END -->
+    <a class="group" href="#deploy-status">六、上线验收与部署</a>
   </nav>
 </aside>
 
@@ -673,7 +683,7 @@ tests/e2e/test_v2_lite_greedy.py     | 69 +++++++++++++++++++++++-------------
   </div>
 </details>
 </div>
-<div class="doc-group" id="lib-plan"><h3>规划与路线 <span class="doc-count">1 篇</span></h3>
+<div class="doc-group" id="lib-plan"><h3>规划与路线 <span class="doc-count">3 篇</span></h3>
 <details class="doc" id="doc-上线路线图">
   <summary><span class="doc-title">上线路线图（2026-11-23）</span><span class="doc-meta">3.6 KB · Markdown 原文</span></summary>
   <div class="doc-body">
@@ -704,9 +714,137 @@ tests/e2e/test_v2_lite_greedy.py     | 69 +++++++++++++++++++++++-------------
 <p>Cascade 的竞争力在<strong>可控性与定制纵深</strong>（MTP/批不变/结构化输出的自研路径）， 不在生产成熟度。若只需“一个 V2-Lite 服务”，vLLM 更稳；若业务需要深度定制 （特殊调度、投机解码、内嵌引擎），Cascade 价值成立。性能对标数字出来后此 判断将有量化支撑。</p>
   </div>
 </details>
+<details class="doc" id="doc-上线配置与灰度清单-2026-11-26">
+  <summary><span class="doc-title">Cascade 推理引擎上线配置与灰度清单</span><span class="doc-meta">3.5 KB · Markdown 原文</span></summary>
+  <div class="doc-body">
+<h4>Cascade 推理引擎上线配置与灰度清单</h4>
+<p>实例：<code>c4ae4b8669-a9956a39</code>（4080 SUPER 32GB，Ubuntu 22.04 容器） 验收代码：<code>feat/ngram-fp8-kv-web</code> @ <code>327b3b4</code></p>
+<h5>1. 配置矩阵</h5>
+<table><thead><tr><th>文件</th><th>用途</th></tr></thead><tbody><tr><td><code>deploy/systemd/cascade-infer.service</code></td><td>标准 Linux systemd 服务（自动拉起、重启、日志轮转）</td></tr><tr><td><code>deploy/supervisor/cascade-infer.conf</code></td><td>容器 supervisord 等效守护配置</td></tr><tr><td><code>deploy/nginx/cascade.conf</code></td><td>内网 HTTP 反代、SSE、限流、超时、安全响应头</td></tr><tr><td><code>deploy/alerting/cascade.rules.yml</code></td><td>Prometheus 告警规则：不可用、错误率、吞吐、延迟、显存</td></tr><tr><td><code>deploy/env.example</code></td><td>部署参数示例，无真实凭据</td></tr><tr><td><code>scripts/production_gate.sh</code></td><td>生产探活、鉴权、推理、指标与压测门禁</td></tr></tbody></table>
+<p><strong>注意</strong>：该实例 PID 1 是 bash，由 supervisord 托管，不能使用 systemd。 systemd 文件用于标准主机；此实例实际部署 supervisor 配置。</p>
+<h5>2. 验收门禁</h5>
+<ul><li>[x] 精确 release tree 跑完 <code>acceptance_full.sh</code>，日志含 <code>ACCEPTANCE FULL OK</code>。</li><li>[x] CPU 全绿；GPU <code>model/triton_ops/engine</code> 全绿；真实 V2-Lite e2e 通过。</li><li>[x] HTTP 生产探活：无 key 401、合法 key 200、chat 200、<code>/metrics</code> 200。</li><li>[x] 8/16/32 并发 SSE 压测：零错误，记录 QPS / tokens/s / TTFT / TPOT。</li><li>[x] n-gram 和 FP8 各做独立 e2e；混合配置只作为可选实验，不默认上线。</li><li>[x] 服务重启恢复、反代转发、SSE 不缓冲、限流返回 429。</li><li>[ ] 保存 commit、GPU、驱动、PyTorch、测试与压测结果。</li></ul>
+<h5>3. 灰度步骤</h5>
+<ol><li><strong>冻结</strong>：只使用通过验收的 commit；不直接部署 master 最新提交。</li><li><strong>单实例</strong>：bf16、<code>MAX_LEN=4096</code>、<code>MAX_SEQS=24</code>、32GB 卡，不默认开 n-gram/FP8。</li><li><strong>内网</strong>：应用只监听 <code>127.0.0.1:8000</code>；业务通过 nginx <code>8080</code> 访问。</li><li><strong>密钥</strong>：真实 API key 写在实例 root-only 环境文件，不提交仓库、不写公开文档。</li><li><strong>反代</strong>：启用安全响应头、请求体 10MB 上限、连接/请求限流、SSE <code>proxy_buffering off</code>。</li><li><strong>守护</strong>：容器用 supervisor；标准主机用 systemd。健康检查失败触发运维告警。</li><li><strong>灰度</strong>：先内部 smoke → 1% 内部真实请求 → 5% 观察 24–48h → 逐级放量。</li><li><strong>指标</strong>：请求量、5xx/判死率、TTFT/TPOT、tokens/s、GPU 利用率/显存、进程重启次数。</li><li><strong>容量</strong>：不得把 32 并发当永久上限；按真实 prompt 长度和输出长度重新确定。</li><li><strong>回滚</strong>：停止新实例，恢复上一 commit/配置；健康检查失败不继续放量。</li></ol>
+<h5>4. 放量/回滚阈值</h5>
+<ul><li>5xx 或 engine error 连续 5 分钟 &gt;2%：停止放量并排查。</li><li>进程不可用 &gt;1 分钟：告警；&gt;5 分钟：回滚。</li><li>TTFT p95 &gt;2s 或 TPOT p95 &gt;100ms 持续 10 分钟：降低并发。</li><li>GPU 显存 &gt;95% 持续 5 分钟：禁止加并发，必要时降 <code>MAX_SEQS</code>。</li><li>单次 OOM/全批 <code>EngineStepError</code>：视为阻断放量事件。</li></ul>
+<h5>5. 生产建议</h5>
+<ul><li><strong>32GB 可灰度；48GB 更适合正式业务</strong>。当前实例不是容量承诺依据。</li><li><strong>32GB + CUDA Graph 下 <code>MAX_SEQS=32</code> 实测 32 活跃并发 OOM</strong>；灰度固定 24， 32 客户端会排队（0 错误但 TTFT 升高）。</li><li>V2-Lite bf16 权重约 29.3GB；FP8 KV 不减少权重显存。</li><li>仅支持 DeepSeek-V2/V2-Lite；不要接 V3/R1 请求。</li><li>公网 HTTPS、WAF、配额与审计属于对外上线前置项；当前配置为内网灰度。</li></ul>
+  </div>
+</details>
+<details class="doc" id="doc-上线验收与部署-2026-11-26">
+  <summary><span class="doc-title">上线验收与部署（2026-11-26）</span><span class="doc-meta">4.0 KB · Markdown 原文</span></summary>
+  <div class="doc-body">
+<h4>上线验收与部署（2026-11-26）</h4>
+<p>实例：<code>c4ae4b8669-a9956a39</code>（RTX 4080 SUPER 32GB，Ubuntu 22.04 容器） 验收代码：<code>feat/ngram-fp8-kv-web</code> @ <code>327b3b4</code>（release tree 精确归档部署）</p>
+<h5>1. 验收结果</h5>
+<table><thead><tr><th>项</th><th>结果</th></tr></thead><tbody><tr><td>精确 release tree <code>acceptance_full.sh</code></td><td><strong>PASS（ACCEPTANCE FULL OK）</strong></td></tr><tr><td>CPU 测试</td><td>通过（acceptance 第一阶段）</td></tr><tr><td><code>tests/model + tests/triton_ops + tests/engine</code></td><td>通过（140 passed / 9 skipped 口径）</td></tr><tr><td><code>tests/e2e</code>（真实 V2-Lite）</td><td>通过（本轮日志）</td></tr><tr><td>CLI 冒烟</td><td>PASS（两个 prompt 均输出）</td></tr><tr><td>HTTP serving 冒烟</td><td>PASS（/v1/models 200、chat/completions 200）</td></tr><tr><td>生产门禁 <code>production_gate.sh</code></td><td><strong>PASS（GATE OK）</strong></td></tr><tr><td>8/16/32 并发压测</td><td><strong>PASS（0 errors）</strong></td></tr></tbody></table>
+<h6>压测（<code>MAX_SEQS=24</code>，nginx :8080，SSE）</h6>
+<table><thead><tr><th>并发客户端</th><th>QPS</th><th>tokens/s</th><th>TTFT p50</th><th>TPOT p50</th></tr></thead><tbody><tr><td>8</td><td>7.45</td><td>223.6</td><td>223 ms</td><td>21.7 ms</td></tr><tr><td>16</td><td>15.62</td><td>468.5</td><td>250 ms</td><td>22.7 ms</td></tr><tr><td>32</td><td>11.81</td><td>354.3</td><td>2582 ms</td><td>27.8 ms</td></tr></tbody></table>
+<p>32 客户端全部成功，但活动序列上限 24，因此排队、TTFT 升高；峰值吞吐在 16 并发。 <code>MAX_SEQS=32</code> 在 32 活跃并发下实测 <code>torch.OutOfMemoryError</code>（服务进程占满 31.46GB）， 灰度配置已降为 24。</p>
+<blockquote>宿主当前负载较高（load average ≈ 30+），模型加载约 10–15 分钟/次； 上述数字以实际日志为准，不会用历史数据替代本轮结果。</blockquote>
+<h5>2. 部署拓扑</h5>
+<pre><code>业务客户端
+   │  http://&lt;内网IP&gt;:8080（或本机 127.0.0.1:8080）
+   ▼
+nginx 1.24（内网反代：鉴权透传、SSE 不缓冲、限流、10MB body）
+   │  http://127.0.0.1:8000
+   ▼
+Cascade HTTP server（--host 127.0.0.1，API key 鉴权）
+   │
+   ▼
+GPU（V2-Lite bf16，MAX_LEN=4096，MAX_SEQS=24）</code></pre>
+<h6>实际守护方式</h6>
+<p>该实例 PID 1 为 bash，由 <code>/bin/supervisord</code> 托管，<strong>没有可用的 systemd</strong>； 实际部署使用独立 supervisord 实例（<code>/etc/cascade-infer/supervisord.conf</code>）， systemd unit 仅提供给标准 Linux 主机。</p>
+<h5>3. 已生成并校验的配置</h5>
+<table><thead><tr><th>文件</th><th>状态</th></tr></thead><tbody><tr><td><code>deploy/systemd/cascade-infer.service</code></td><td>已提供；当前容器不可执行</td></tr><tr><td><code>deploy/supervisor/cascade-infer.conf</code></td><td>参考单程序配置</td></tr><tr><td><code>deploy/supervisord.conf</code></td><td><strong>实际部署</strong>：独立 socket/pid，autorestart</td></tr><tr><td><code>deploy/nginx/nginx.conf</code> + <code>deploy/nginx/cascade.conf</code></td><td><code>nginx -t</code> 通过</td></tr><tr><td><code>deploy/alerting/cascade.rules.yml</code></td><td>YAML 解析通过；需 Prometheus/Alertmanager</td></tr><tr><td><code>deploy/alerting/prometheus-scrape.example.yml</code></td><td>抓取示例（token 文件注入）</td></tr><tr><td><code>deploy/run_server.sh</code></td><td>读取 root-only env 后 exec</td></tr><tr><td><code>deploy/bootstrap.sh</code></td><td>启动 supervisor、等待就绪、启动 nginx</td></tr><tr><td><code>scripts/production_gate.sh</code></td><td>鉴权/推理/指标/反代门禁</td></tr><tr><td><code>scripts/load_test_suite.sh</code></td><td>8/16/32 并发 SSE 压测</td></tr></tbody></table>
+<h5>4. 灰度状态</h5>
+<ul><li>默认配置：<code>bf16</code>、<code>CASCADE_NGRAM_DRAFT=0</code>、<code>CASCADE_KV_DTYPE=bf16</code>。</li><li>n-gram / FP8 已在真实 V2-Lite 上各自通过 e2e；不作为默认流量配置。</li><li>服务仅监听 <code>127.0.0.1:8000</code>，业务通过 nginx <code>8080</code> 访问。</li><li>API key 只在实例 <code>/etc/cascade-infer/env</code>（root-only）中，不写入仓库/公开文档。</li><li>告警规则依赖 Prometheus；本实例未部署完整 Prometheus/Alertmanager 栈， 规则文件与抓取示例已就绪，接入监控系统后生效。</li></ul>
+<h5>5. 放量与回滚</h5>
+<ul><li>观察 5xx/判死率、TTFT/TPOT、tokens/s、GPU 显存、进程重启。</li><li>错误率 &gt;2% 持续 5 分钟：禁止放量；实例不可用 &gt;5 分钟：回滚。</li><li>GPU 显存 &gt;95% 持续 5 分钟：降低 <code>MAX_SEQS</code> 或回滚。</li><li>回滚使用上一 release tree 与 env 文件；保留 nginx 配置不变。</li></ul>
+<h5>6. 已知限制</h5>
+<ul><li>单卡 32GB 仅适合灰度；正式业务建议 48GB。</li><li>FP8 KV 只省 KV，不减少 29.3GB 模型权重。</li><li>仅支持 DeepSeek-V2/V2-Lite；不支持 V3/R1。</li><li>公网 HTTPS/WAF/审计未包含在内，当前为内网灰度配置。</li></ul>
+  </div>
+</details>
 </div>
 </section>
 <!-- DOC_LIBRARY_END -->
+
+<section id="deploy-status">
+  <h2><span class="num">06</span>上线验收与部署（2026-11-26）</h2>
+  <p>实例 <code>c4ae4b8669-a9956a39</code>（RTX 4080 SUPER 32GB，Ubuntu 22.04 容器），
+  精确 release tree <code>327b3b4</code>。宿主当前负载较高（load ≈ 30+），
+  单次真实模型加载约 10–15 分钟，以下结果按本轮实际日志记录。</p>
+
+  <div class="cards">
+    <div class="card"><b>验收版本</b><span><code>feat/ngram-fp8-kv-web</code> @ <code>327b3b4</code>，
+      与 GitHub 分支一致。</span></div>
+    <div class="card"><b>部署方式</b><span>容器无 systemd（PID 1 为 bash），实际用独立
+      supervisord + nginx，systemd unit 已提供给标准主机。</span></div>
+    <div class="card"><b>默认配置</b><span>bf16 KV、n-gram/FP8 关闭、MAX_LEN=4096、
+      MAX_SEQS=24、服务只监听 127.0.0.1:8000。</span></div>
+  </div>
+
+  <h3>验收结果</h3>
+  <table>
+    <thead><tr><th>项目</th><th>结果</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>acceptance_full.sh（精确 release tree）</td><td><span class="status ok" id="acc-full">PASS · ACCEPTANCE FULL OK</span></td><td>日志 <code>/root/acceptance-327b3b4.log</code></td></tr>
+      <tr><td>CPU + model/triton_ops/engine 测试</td><td><span class="status ok">通过</span></td><td>140 passed / 9 skipped 口径</td></tr>
+      <tr><td>e2e 真实 V2-Lite</td><td><span class="status ok">通过</span></td><td>含 teacher-forcing 与 free-running</td></tr>
+      <tr><td>CLI 离线冒烟</td><td><span class="status ok" id="acc-cli">PASS</span></td><td>acceptance 最后阶段</td></tr>
+      <tr><td>HTTP serving 冒烟</td><td><span class="status ok" id="acc-http">PASS · 200/200</span></td><td>acceptance 最后阶段</td></tr>
+      <tr><td>生产门禁 production_gate.sh</td><td><span class="status ok" id="gate">PASS · GATE OK</span></td><td>鉴权 / 推理 / metrics / 反代</td></tr>
+      <tr><td>8 / 16 / 32 并发 SSE 压测</td><td><span class="status ok" id="load">PASS · 0 errors</span></td><td>默认 bf16 配置</td></tr>
+    </tbody>
+  </table>
+
+  <h3>部署拓扑</h3>
+  <div class="topo">
+    <div class="node"><b>业务客户端</b><span>内网访问 :8080</span></div>
+    <div class="arrow">→</div>
+    <div class="node"><b>nginx 1.24</b><span>鉴权透传 / SSE 不缓冲 / 限流 / 10MB body</span></div>
+    <div class="arrow">→</div>
+    <div class="node"><b>Cascade HTTP</b><span>127.0.0.1:8000，API key 鉴权</span></div>
+    <div class="arrow">→</div>
+    <div class="node"><b>GPU</b><span>V2-Lite bf16，CUDA Graph</span></div>
+  </div>
+
+  <h3>已生成并校验的配置</h3>
+  <table>
+    <thead><tr><th>文件</th><th>校验</th></tr></thead>
+    <tbody>
+      <tr><td><code>deploy/supervisord.conf</code></td><td class="ok">实际部署；autorestart + 独立 socket/pid</td></tr>
+      <tr><td><code>deploy/nginx/{nginx.conf,cascade.conf}</code></td><td class="ok">nginx -t 通过</td></tr>
+      <tr><td><code>deploy/systemd/cascade-infer.service</code></td><td>已提供；当前容器无 systemd，不可启用</td></tr>
+      <tr><td><code>deploy/alerting/cascade.rules.yml</code></td><td class="ok">YAML 解析通过；需 Prometheus/Alertmanager</td></tr>
+      <tr><td><code>deploy/alerting/prometheus-scrape.example.yml</code></td><td>抓取示例；密钥走 root-only token 文件</td></tr>
+      <tr><td><code>deploy/bootstrap.sh</code> / <code>run_server.sh</code></td><td class="ok">shell 语法通过</td></tr>
+      <tr><td><code>scripts/production_gate.sh</code></td><td class="ok">shell 语法通过</td></tr>
+      <tr><td><code>scripts/load_test_suite.sh</code></td><td class="ok">8/16/32 并发 SSE</td></tr>
+    </tbody>
+  </table>
+
+  <h3>压测与结论</h3>
+  <table id="load-table">
+    <thead><tr><th>并发</th><th>QPS</th><th>tokens/s</th><th>TTFT p50</th><th>TPOT p50</th></tr></thead>
+    <tbody>
+      <tr><td>8</td><td id="ld8">7.45</td><td id="lt8">223.6</td><td id="lttft8">223 ms</td><td id="ltpot8">21.7 ms</td></tr>
+      <tr><td>16</td><td id="ld16">15.62</td><td id="lt16">468.5</td><td id="lttft16">250 ms</td><td id="ltpot16">22.7 ms</td></tr>
+      <tr><td>32</td><td id="ld32">11.81</td><td id="lt32">354.3</td><td id="lttft32">2582 ms</td><td id="ltpot32">27.8 ms</td></tr>
+    </tbody>
+  </table>
+  <p id="deploy-conclusion">结论：内网灰度可用。8/16/32 客户端均 0 错误；峰值吞吐在 16 并发（468.5 tok/s）。32 客户端受 MAX_SEQS=24 排队影响，TTFT 明显升高；32GB 卡不要设 MAX_SEQS=32（实测 32 活跃并发 OOM）。</p>
+
+  <h3>灰度限制</h3>
+  <ul>
+    <li>32GB 仅适合灰度；48GB 更适合正式业务。32GB + CUDA Graph 下 MAX_SEQS=32 实测 32 活跃并发 OOM，灰度固定 24。</li>
+    <li>FP8 KV 只省 KV，不减少 29.3GB 模型权重；默认关闭。</li>
+    <li>n-gram / FP8 已各自通过真模型 e2e，但不作为默认流量配置。</li>
+    <li>告警规则依赖 Prometheus/DCGM；本实例未部署完整监控栈，规则与抓取示例已就绪。</li>
+    <li>公网 HTTPS/WAF/审计未包含，当前仅内网灰度。</li>
+  </ul>
+</section>
 
 <footer>
   <span>Cascade · 生产级 LLM 推理引擎</span>

@@ -11,13 +11,13 @@
 #
 # 说明:
 # - 模型加载需 7-10 分钟，就绪前 /v1/models 会连接被拒（正常）。
-# - 32GB 卡建议 MAX_LEN=4096 MAX_SEQS=32；48GB+ 可放宽。
+# - 32GB 卡建议 MAX_LEN=4096 MAX_SEQS=24；48GB+ 可放宽。
 set -euo pipefail
 
 : "${CASCADE_MODEL:?需要设置 CASCADE_MODEL 指向本地 HF 格式模型目录}"
 PORT="${PORT:-8000}"
 MAX_LEN="${MAX_LEN:-4096}"
-MAX_SEQS="${MAX_SEQS:-32}"
+MAX_SEQS="${MAX_SEQS:-24}"
 API_KEY="${API_KEY:-}"
 LOG="${LOG:-/root/cascade_server.log}"
 PIDFILE="${PIDFILE:-/root/cascade_server.pid}"
