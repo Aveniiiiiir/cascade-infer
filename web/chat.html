@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Cascade 对话</title>
+<link rel="stylesheet" href="chat.css" />
+</head>
+<body class="chat-page">
+<header class="chat-nav">
+  <a class="chat-brand" href="index.html">
+    <span class="mark" aria-hidden="true">
+      <svg viewBox="0 0 32 32" fill="none"><path d="M4 22 12 6l6 12 4-8 6 12" stroke="url(#cg)" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/><defs><linearGradient id="cg" x1="0" y1="0" x2="32" y2="32"><stop stop-color="#67e8f9"/><stop offset=".55" stop-color="#818cf8"/><stop offset="1" stop-color="#f472b6"/></linearGradient></defs></svg>
+    </span>
+    <span class="name">Cascade</span>
+    <span class="tag">对话</span>
+  </a>
+  <div class="chat-nav-actions">
+    <span class="conn"><i id="connDot"></i><span id="connText">连接中</span></span>
+    <a class="nav-link" href="index.html">首页</a>
+    <button class="ghost-btn" id="clearBtn" type="button">清空</button>
+  </div>
+</header>
+
+<main class="chat-layout">
+  <aside class="chat-side">
+    <div class="side-block">
+      <div class="side-label">模型</div>
+      <div class="model-card">
+        <b>DeepSeek-V2-Lite</b>
+        <span>MLA + MoE · bf16 · CUDA Graph</span>
+      </div>
+    </div>
+    <div class="side-block">
+      <div class="side-label">生成参数</div>
+      <label class="field">
+        <span>max_tokens <b id="maxOut">256</b></span>
+        <input id="maxTokens" type="range" min="32" max="1024" step="32" value="256" />
+      </label>
+      <label class="field">
+        <span>temperature <b id="tempOut">0.0</b></span>
+        <input id="temperature" type="range" min="0" max="1.5" step="0.1" value="0" />
+      </label>
+    </div>
+    <div class="side-block">
+      <div class="side-label">试试</div>
+      <button class="suggest" type="button">用三句话解释 MLA 注意力</button>
+      <button class="suggest" type="button">写一个 Python 快速排序</button>
+      <button class="suggest" type="button">把这段话改得更简洁</button>
+    </div>
+    <div class="side-note">
+      内部灰度实例 · 仅内网访问<br />
+      由 nginx 注入鉴权，浏览器不保存密钥
+    </div>
+  </aside>
+
+  <section class="chat-main">
+    <div class="messages" id="messages">
+      <div class="empty" id="empty">
+        <div class="empty-glow"></div>
+        <h1>今天想聊什么？</h1>
+        <p>对话直接跑在实例的 4080 SUPER 上，SSE 流式返回。</p>
+        <div class="empty-chips">
+          <button type="button">写一个快速排序</button>
+          <button type="button">解释一下 MoE 路由</button>
+          <button type="button">帮我改一段文案</button>
+        </div>
+      </div>
+    </div>
+
+    <form class="composer" id="composer">
+      <div class="composer-inner">
+        <textarea id="input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行" autocomplete="off"></textarea>
+        <div class="composer-actions">
+          <span class="composer-hint" id="stats"></span>
+          <button class="send-btn" id="sendBtn" type="submit">
+            <span>发送</span>
+            <svg viewBox="0 0 24 24" fill="none"><path d="m4 12 16-8-6 8 6 8-16-8Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>
+          </button>
+          <button class="stop-btn" id="stopBtn" type="button" hidden>停止</button>
+        </div>
+      </div>
+    </form>
+  </section>
+</main>
+<script src="chat.js"></script>
+</body>
+</html>
