@@ -30,6 +30,15 @@
    官方 fp32 路径（638 vs 631/640）；换环境需重测（见 moe.py docstring）。
 6. **确定性采样**：RNG = f(seq_seed, 绝对位置, 用途流)；`derive_num_blocks`
    按保留行 (n+1) 计。
+7. **投机解码双源**：MTP（需要 nextn 权重）与 n-gram（无 draft 模型，
+   `CASCADE_NGRAM_DRAFT=1`）。n-gram 草案是 one-hot 稀疏分布，走
+   `mtp_verify(draft_token_probs=...)`（不分配 [K, V]）；CUDA graph 的
+   多 token 验证行要求整批 v=1+K 一致，`uniform_v` 路径把段元数据全部
+   张量化（positions[::v]+v 推导），varlen/动态长度自动退化 eager。
+8. **FP8 KV**：`CASCADE_KV_DTYPE=fp8` 或 `--kv-cache-dtype fp8`。布局 =
+   c(float8_e4m3) + rope(bf16) + 每 128 维一组 fp32 scale；量化在 torch 侧
+   完成、kernel 只搬字节（规避 sm89 上 Triton fp8 cast 的版本差异）；
+   显式路径 gather 必须用 int8 视图（CPU 的 fp8 高级索引未实现）。
 
 ## 陷阱（历史上真实炸过）
 

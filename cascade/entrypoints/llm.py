@@ -25,6 +25,7 @@ class LLM:
         max_num_batched_tokens: int = 8192,
         enable_prefix_caching: bool = True,
         num_blocks: int | None = None,
+        kv_cache_dtype: str | None = None,
     ) -> None:
         import torch
 
@@ -46,7 +47,7 @@ class LLM:
         self.eos_token_id = int(hf.get("eos_token_id", gen.get("eos_token_id", 3)))
         cfg = EngineConfig(
             model=model_cfg,
-            cache=CacheConfig(),
+            cache=CacheConfig(kv_dtype=kv_cache_dtype or "bf16"),
             scheduler=SchedulerConfig(
                 max_num_seqs=max_num_seqs,
                 max_num_batched_tokens=max_num_batched_tokens,

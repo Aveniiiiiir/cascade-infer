@@ -80,6 +80,21 @@ class LLMEngine:
 
         if dtype is None:
             dtype = torch.bfloat16
+        if envs.KV_DTYPE != "bf16" and engine_cfg.cache.kv_dtype == "bf16":
+            # CASCADE_KV_DTYPE=fp8：显式构造参数优先，env 只覆盖默认值
+            engine_cfg.cache.kv_dtype = envs.KV_DTYPE
+        if draft_model is None and envs.NGRAM_DRAFT:
+            # n-gram/prompt-lookup：无 draft 模型投机解码（V2-Lite 无 nextn
+            # 权重，这是唯一的零训练 SD 路径）。草案 one-hot → 稀疏验证。
+            from cascade.sampling.ngram_draft import NGramDraftModel
+
+            draft_model = NGramDraftModel(
+                min_gram=envs.NGRAM_MIN_GRAM,
+                max_gram=envs.NGRAM_MAX_GRAM,
+                max_draft=envs.NGRAM_MAX_DRAFT,
+            )
+            if engine_cfg.scheduler.nextn_draft_tokens == 0:
+                engine_cfg.scheduler.nextn_draft_tokens = envs.NGRAM_MAX_DRAFT
         if draft_model is not None and engine_cfg.scheduler.nextn_draft_tokens == 0:
             # 默认验证长度取 env（DeepInfer NEXTN_DECODE 默认 5；Cascade 默认 3）。
             # 注意：这里变异调用方传入的 engine_cfg（共享对象）——引擎构造后
@@ -262,22 +277,17 @@ class LLMEngine:
             return None
         scheduled = sched_out.scheduled
         n = len(scheduled)
-        if n == 0 or any(s.is_prefill or s.num_new_tokens != 1 for s in scheduled):
+        v = self.graph_runner.tokens_per_seq  # 1 或 1+K（投机验证行）
+        if n == 0 or any(s.is_prefill or s.num_new_tokens != v for s in scheduled):
             return None
         if not self.graph_runner.can_run(n):
             return None
-        tokens, positions, block_rows = [], [], []
-        for s in scheduled:
-            seq = s.seq
-            pos = seq.num_tokens_computed - 1
-            tokens.append(seq.token_at(pos))
-            positions.append(pos)
-            block_rows.append(seq.block_table)
-        hidden = self.graph_runner.replay(tokens, positions, block_rows)  # [T, H]
-        logits = self.runner.model.lm_head(hidden[:n])  # 图外一次 GEMM
+        tokens, positions, block_rows = self.runner.graph_inputs(sched_out, v)
+        hidden = self.graph_runner.replay(tokens, positions, block_rows)  # [n*v, H]
+        logits = self.runner.model.lm_head(hidden[: n * v])  # 图外一次 GEMM
         # decode 元数据（launch_sample 只读 sample_flags / segment_offsets /
-        # segment_lens 三个字段；segment_offsets 即批内行号）
-        batch = self.runner.decode_batch_meta(n)
+        # segment_lens 三个字段；每 seq v 行，采样/验证行由段偏移推导）
+        batch = self.runner.decode_batch_meta(n, v)
         return logits, batch
 
     def _pump_so(self) -> None:

@@ -11,12 +11,38 @@ from __future__ import annotations
 
 from cascade.config import ModelConfig
 
-#: bf16/fp16 每元素 2 字节；FP8 变体（interleaved [data|scale]）Phase 6 引入
+#: bf16/fp16 每元素 2 字节；fp8 = latent c 1 B + rope bf16 2 B + 分组 scale
 DTYPE_SIZES = {"bf16": 2, "fp16": 2, "fp8": 1}
+
+#: FP8(e4m3) 的最大表示值（量化 scale = absmax / 448）
+FP8_MAX = 448.0
+
+#: FP8 KV 的分组 scale 粒度（DeepSeek-V3 生产格式：每 128 维一个 fp32 scale）
+FP8_SCALE_GROUP = 128
+
+
+def fp8_group_size(kv_lora_rank: int) -> int:
+    """每组维度：128（512 等 128 的倍数）或整段（tiny 模型 <128）。"""
+    return FP8_SCALE_GROUP if kv_lora_rank % FP8_SCALE_GROUP == 0 else kv_lora_rank
+
+
+def fp8_num_groups(model_cfg: ModelConfig) -> int:
+    return model_cfg.kv_lora_rank // fp8_group_size(model_cfg.kv_lora_rank)
 
 
 def kv_bytes_per_token(model_cfg: ModelConfig, dtype: str = "bf16") -> int:
-    """单 token 单层的 KV 字节数。"""
+    """单 token 单层的 KV 字节数。
+
+    fp8 混合布局：c(kv_lora) 1 B + k_rope 2 B + 每 128 维一个 fp32 scale。
+    V2-Lite：512 + 128 + 16 = 656 B（bf16 为 1152 B，≈1.76×）。
+    """
+    if dtype == "fp8":
+        groups = fp8_num_groups(model_cfg)
+        return (
+            model_cfg.kv_lora_rank
+            + model_cfg.qk_rope_head_dim * 2
+            + groups * 4
+        )
     return model_cfg.kv_cache_dim * DTYPE_SIZES[dtype]
 
 
@@ -61,11 +87,33 @@ def kv_shape(model_cfg: ModelConfig, num_blocks: int, block_size: int) -> tuple[
     return (model_cfg.num_layers, num_blocks + 1, block_size, model_cfg.kv_cache_dim)
 
 
+def kv_shapes_fp8(
+    model_cfg: ModelConfig, num_blocks: int, block_size: int
+) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    """FP8 混合布局的三张量形状：(c, rope, scale)。
+
+    c:     [L, n+1, bs, kv_lora]          float8_e4m3fn
+    rope:  [L, n+1, bs, qk_rope]          bf16
+    scale: [L, n+1, bs, num_groups]       fp32（每 128 维一个 absmax/448）
+    """
+    head = (model_cfg.num_layers, num_blocks + 1, block_size)
+    return (
+        (*head, model_cfg.kv_lora_rank),
+        (*head, model_cfg.qk_rope_head_dim),
+        (*head, fp8_num_groups(model_cfg)),
+    )
+
+
 __all__ = [
     "DTYPE_SIZES",
+    "FP8_MAX",
+    "FP8_SCALE_GROUP",
+    "fp8_group_size",
+    "fp8_num_groups",
     "kv_bytes_per_token",
     "kv_bytes_per_block",
     "kv_total_bytes",
     "derive_num_blocks",
     "kv_shape",
+    "kv_shapes_fp8",
 ]

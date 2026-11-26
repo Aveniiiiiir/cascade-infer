@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -46,15 +47,31 @@ class MtpVerifyResult:
 
 def mtp_verify(
     target_logprobs: torch.Tensor,  # [K+1, V] fp32（log_softmax 后）
-    draft_logprobs: torch.Tensor,  # [K, V] fp32（K=0 时形状 [0, V]）
+    draft_logprobs: torch.Tensor | None,  # [K, V] fp32（K=0 时形状 [0, V]；稀疏路径 None）
     draft_tokens: torch.Tensor,  # [K] int（-1 = fresh 哨兵 → 强制拒绝）
     accept_u: torch.Tensor,  # [K] fp32（verify 流均匀数）
     sample_u: torch.Tensor,  # [K+1] fp32（case=0 流；[j] = 位置 P+j+1）
+    draft_token_probs: torch.Tensor | None = None,  # [K] fp32：稀疏（one-hot）草案分布
 ) -> MtpVerifyResult:
-    """单请求的 MTP 验证（torch 参考实现；fused Triton kernel 后置）。"""
+    """单请求的 MTP 验证（torch 参考实现；fused Triton kernel 后置）。
+
+    ``draft_token_probs`` 非 None 时走**稀疏草案**路径（n-gram/prompt-lookup：
+    草案分布是单点 p[d]，无需 [K, V] 全量分配）：
+        ratio = exp(min(q_lp[d] − log p_d, 0))
+        拒绝残差 = relu(q − α·p·e_d)
+        接受概率 = min(q[d], p_d)（该式即 Σ_x min(p,q) 在单点分布上的精确值，
+        比全量路径的 1−Σrelu 估计更准，varlen 接受率回灌因此不虚高）
+    """
     K1, V = target_logprobs.shape
     K = K1 - 1
-    assert draft_logprobs.shape == (K, V) and draft_tokens.shape == (K,)
+    if draft_logprobs is not None:
+        assert draft_logprobs.shape == (K, V), (draft_logprobs.shape, (K, V))
+        assert draft_token_probs is None, "稀疏/全量草案分布二选一"
+    else:
+        assert draft_token_probs is not None and draft_token_probs.shape == (K,), (
+            "稀疏路径必须提供 draft_token_probs [K]"
+        )
+    assert draft_tokens.shape == (K,)
     assert accept_u.shape == (K,) and sample_u.shape == (K + 1,)
     q = target_logprobs.exp()  # [K+1, V] 概率（未归一亦可，逆 CDF 自适应）
 
@@ -67,24 +84,42 @@ def mtp_verify(
     for j in range(K):
         d = int(draft_tokens[j])
         q_lp = target_logprobs[j]
-        p_lp = draft_logprobs[j]
-        if d < 0:
-            # fresh 哨兵（varlen 的 v=0 行）：强制拒绝，残差 = q
+        if draft_logprobs is None:
+            p_d = float(draft_token_probs[j])  # type: ignore[index]
+            p_lp = None
+            valid_draft = d >= 0 and p_d > 0.0
+        else:
+            p_d = 0.0
+            p_lp = draft_logprobs[j]
+            valid_draft = d >= 0
+        if not valid_draft:
+            # fresh 哨兵（varlen 的 v=0 行 / n-gram 未命中）：强制拒绝，残差 = q
             token = _inv_cdf(q[j], float(sample_u[j]))
             row_tokens.append(token)
             accepted.append(False)
             accept_probs.append(1.0)
             committed.append(token)
             return MtpVerifyResult(row_tokens, -1, accepted, accept_probs, committed, 0)
-        ratio = torch.exp(torch.clamp(q_lp[d] - p_lp[d], max=0.0))
+        if p_lp is not None:
+            ratio = torch.exp(torch.clamp(q_lp[d] - p_lp[d], max=0.0))
+        else:
+            # 稀疏：p[d] = p_d（其余列 0）→ log p_d；零概率走上面的 fresh 分支
+            ratio = math.exp(min(float(q_lp[d]) - math.log(p_d), 0.0))
         if float(accept_u[j]) < float(ratio):
             row_tokens.append(d)
             accepted.append(True)
-            accept_probs.append(_accept_prob(q[j], draft_logprobs[j]))
+            accept_probs.append(
+                _accept_prob(q[j], p_lp) if p_lp is not None else _accept_prob_sparse(q[j], d, p_d)
+            )
             committed.append(d)
             n_accepted += 1
         else:
-            residual = torch.relu(q[j] - _ALPHA * draft_logprobs[j].exp())
+            if p_lp is not None:
+                residual = torch.relu(q[j] - _ALPHA * p_lp.exp())
+            else:
+                # relu(q − α·p_d·e_d)：只需在 d 列做减法
+                residual = q[j].clone()
+                residual[d] = torch.clamp(residual[d] - _ALPHA * p_d, min=0.0)
             # 残差全零（draft 分布在所有列都 ≥ target/α）时回退到 target
             # 分布 q 本身——拒绝采样的偏差界允许此退化（DeepInfer 同语义），
             # 否则 _inv_cdf 对全零行报错杀死请求
@@ -93,7 +128,9 @@ def mtp_verify(
             token = _inv_cdf(residual, float(sample_u[j]))
             row_tokens.append(token)
             accepted.append(False)
-            accept_probs.append(_accept_prob(q[j], draft_logprobs[j]))
+            accept_probs.append(
+                _accept_prob(q[j], p_lp) if p_lp is not None else _accept_prob_sparse(q[j], d, p_d)
+            )
             committed.append(token)
             return MtpVerifyResult(row_tokens, -1, accepted, accept_probs, committed, n_accepted)
     # 全接受 → bonus（K=0 时直接到这里：普通确定性采样）
@@ -127,6 +164,11 @@ def _accept_prob(q: torch.Tensor, p_lp: torch.Tensor) -> float:
     （DeepInfer 用它做置信度头的在线校准监控）。"""
     residual = torch.relu(q - _ALPHA * p_lp.exp())
     return float(torch.clamp(1.0 - residual.sum(), min=0.0).item())
+
+
+def _accept_prob_sparse(q: torch.Tensor, d: int, p_d: float) -> float:
+    """单点草案分布的精确接受概率 Σ_x min(p(x), q(x)) = min(p_d, q[d])。"""
+    return float(min(max(float(q[d]), 0.0), max(p_d, 0.0)))
 
 
 __all__ = ["mtp_verify", "MtpVerifyResult", "DRAFT_PROB_PENALTY"]

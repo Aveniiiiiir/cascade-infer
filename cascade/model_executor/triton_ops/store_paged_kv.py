@@ -45,6 +45,47 @@ if triton is not None:
         dst = (block * BLOCK_SIZE + slot) * dim + offs_d
         tl.store(kv_ptr + dst, val, mask=mask)
 
+    @triton.jit
+    def _store_paged_kv_fp8_kernel(
+        c_ptr,  # [num_blocks, block_size, kv_lora] float8_e4m3fn（按 i8 拷贝）
+        rope_ptr,  # [num_blocks, block_size, rope] bf16
+        scale_ptr,  # [num_blocks, block_size] fp32
+        cq_ptr,  # [T, kv_lora] float8_e4m3fn（调用方已量化）
+        qscale_ptr,  # [T, NUM_GROUPS] fp32（每 128 维一个 scale）
+        latent_ptr,  # [T, kv_lora + rope] bf16（rope 源）
+        seq_ids_ptr,  # [T] int64
+        positions_ptr,  # [T] int64
+        block_tables_ptr,  # [n_seqs, max_blocks] int64
+        max_blocks,
+        KV_LORA: tl.constexpr,
+        ROPE: tl.constexpr,
+        CPAD: tl.constexpr,
+        RPAD: tl.constexpr,
+        NUM_GROUPS: tl.constexpr,
+        GPAD: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        """c/rope/scale 三路原地写入（c 为已量化字节，kernel 只搬运）。"""
+        t = tl.program_id(0)
+        seq = tl.load(seq_ids_ptr + t)
+        pos = tl.load(positions_ptr + t)
+        block = tl.load(block_tables_ptr + seq * max_blocks + pos // BLOCK_SIZE)
+        slot = pos % BLOCK_SIZE
+        row = (block * BLOCK_SIZE + slot).to(tl.int64)
+        offs_c = tl.arange(0, CPAD)
+        mc = offs_c < KV_LORA
+        cv = tl.load(cq_ptr + t.to(tl.int64) * KV_LORA + offs_c, mask=mc)
+        tl.store(c_ptr + row * KV_LORA + offs_c, cv, mask=mc)
+        offs_r = tl.arange(0, RPAD)
+        mr = offs_r < ROPE
+        dim = KV_LORA + ROPE
+        rv = tl.load(latent_ptr + t.to(tl.int64) * dim + KV_LORA + offs_r, mask=mr)
+        tl.store(rope_ptr + row * ROPE + offs_r, rv, mask=mr)
+        offs_g = tl.arange(0, GPAD)
+        mg = offs_g < NUM_GROUPS
+        sc = tl.load(qscale_ptr + t * NUM_GROUPS + offs_g, mask=mg)
+        tl.store(scale_ptr + row * NUM_GROUPS + offs_g, sc, mask=mg)
+
 
 def store_paged_kv(
     kv: torch.Tensor,  # [num_blocks, block_size, dim]，本层视图
@@ -95,4 +136,70 @@ def store_paged_kv_ref(
     kv[blocks, slots] = latent.to(kv.dtype)
 
 
-__all__ = ["store_paged_kv", "store_paged_kv_ref"]
+def store_paged_kv_fp8(
+    c: torch.Tensor,  # [num_blocks, bs, kv_lora] float8_e4m3fn 本层视图
+    rope: torch.Tensor,  # [num_blocks, bs, rope] 模型 dtype 本层视图
+    scale: torch.Tensor,  # [num_blocks, bs] fp32 本层视图
+    latent: torch.Tensor,  # [T, kv_lora + rope] 本步 KV（c 未量化）
+    seq_ids: torch.Tensor,
+    positions: torch.Tensor,
+    block_tables: torch.Tensor,
+) -> None:
+    """FP8 混合布局写入：c 每 token absmax/448 量化，rope 原精度，scale 落盘。
+
+    量化在 PyTorch 侧完成（向量化、图捕获安全）；Triton kernel 只做三路
+    字节搬运——避免在 sm89 上依赖 Triton 的 bf16→fp8 cast 指令支持
+    （PTX cvt.e4m3 在 Ada 可用，但 Triton 版本差异大）。
+    """
+    T = latent.shape[0]
+    if T == 0:
+        return
+    assert latent.is_contiguous() and block_tables.is_contiguous()
+    kv_lora = c.shape[-1]
+    rope_dim = rope.shape[-1]
+    assert latent.shape[1] == kv_lora + rope_dim and rope.shape[2] == rope_dim
+    assert c.dtype == torch.float8_e4m3fn and rope.dtype in (torch.bfloat16, torch.float16)
+    from cascade.worker.kv_layout import FP8_MAX, fp8_group_size
+
+    group = fp8_group_size(kv_lora)
+    num_groups = kv_lora // group
+    assert scale.shape[-1] == num_groups, (scale.shape, num_groups)
+    cf = latent[:, :kv_lora].float().view(T, num_groups, group)
+    qscale = (cf.abs().amax(dim=-1) / FP8_MAX).clamp_min(1e-12)  # [T, G]
+    cq = (
+        (cf / qscale.unsqueeze(-1)).clamp(-FP8_MAX, FP8_MAX)
+        .to(torch.float8_e4m3fn)
+        .view(T, kv_lora)
+    )
+    if use_triton(c.device):
+        bs = c.shape[1]
+        _store_paged_kv_fp8_kernel[(T,)](
+            c.view(torch.int8),
+            rope,
+            scale,
+            cq.view(torch.int8),
+            qscale,
+            latent,
+            seq_ids,
+            positions,
+            block_tables,
+            block_tables.shape[1],
+            KV_LORA=kv_lora,
+            ROPE=rope_dim,
+            CPAD=triton.next_power_of_2(kv_lora),
+            RPAD=triton.next_power_of_2(rope_dim),
+            NUM_GROUPS=num_groups,
+            GPAD=triton.next_power_of_2(num_groups),
+            BLOCK_SIZE=bs,
+            num_warps=4,
+        )
+    else:
+        bs = c.shape[1]
+        blocks = block_tables[seq_ids, torch.div(positions, bs, rounding_mode="floor")]
+        slots = positions % bs
+        c[blocks, slots] = cq
+        rope[blocks, slots] = latent[:, kv_lora:].to(rope.dtype)
+        scale[blocks, slots] = qscale
+
+
+__all__ = ["store_paged_kv", "store_paged_kv_ref", "store_paged_kv_fp8"]

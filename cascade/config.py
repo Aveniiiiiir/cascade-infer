@@ -201,16 +201,23 @@ class CacheConfig:
 
     `num_gpu_blocks=None` means "derive at runtime from a profile run"
     (Phase 2+); the CPU test harness sets an explicit small value.
+
+    `kv_dtype`:
+    - ``"bf16"``：c‖rope 单张量，2 B/元素（默认）
+    - ``"fp8"``：latent c 存 FP8(e4m3) + k_rope 存 bf16 + 每 token fp32 scale
+      （DeepSeek-V3 生产同构；KV 字节/token/层 1152 → 644 ≈ 1.79× 压缩）
     """
 
     block_size: int = 64
     num_gpu_blocks: int | None = None
     gpu_memory_utilization: float = 0.9
+    kv_dtype: str = "bf16"
 
     def validate(self) -> None:
         assert self.block_size > 0
         assert self.num_gpu_blocks is None or self.num_gpu_blocks > 0
         assert 0.0 < self.gpu_memory_utilization <= 1.0
+        assert self.kv_dtype in ("bf16", "fp8"), f"不支持的 kv_dtype {self.kv_dtype!r}"
 
 
 @dataclass

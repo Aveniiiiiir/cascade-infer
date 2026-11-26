@@ -54,6 +54,7 @@ class CudaGraphRunner:
         "cfg",
         "device",
         "max_batch_size",
+        "tokens_per_seq",
         "num_splits",
         "scratch_block",
         "block_size",
@@ -80,6 +81,10 @@ class CudaGraphRunner:
         self.cfg = cfg
         self.device = device
         self.max_batch_size = max_batch_size
+        #: 每 seq 的 decode 行数：1（普通）或 1+K（MTP/n-gram 验证）。
+        #: 图按 (n_seqs 档位, 固定 v) 捕获——投机解码要求整批 v 一致，
+        #: 变长验证（varlen/动态草案）自动退化到 eager（engine 判定）。
+        self.tokens_per_seq = 1 + int(cfg.scheduler.nextn_draft_tokens)
         self.num_splits = num_splits if num_splits is not None else envs.CUDAGRAPH_NUM_SPLITS
         self.scratch_block = scratch_block
         self.block_size = cache.cache_cfg.block_size
@@ -130,16 +135,19 @@ class CudaGraphRunner:
 
     # ------------------------------------------------------------------ capture
 
-    def _capture_tier(self, T: int) -> DecodeGraphTier:
+    def _capture_tier(self, size: int) -> DecodeGraphTier:
+        """size = **seq 数**；张量行数 T = size × tokens_per_seq。"""
         dev = self.device
+        v = self.tokens_per_seq
+        T = size * v
         input_ids = torch.zeros(T, dtype=torch.int64, device=dev)
         positions = torch.zeros(T, dtype=torch.int64, device=dev)
-        seq_ids = torch.arange(T, dtype=torch.int64, device=dev)
+        seq_ids = torch.arange(size, dtype=torch.int64, device=dev).repeat_interleave(v)
         # 全部行初始指向 scratch 块（warmup/捕获的写入无害）
         block_tables = torch.full(
-            (T, self.max_bt), self.scratch_block, dtype=torch.int64, device=dev
+            (size, self.max_bt), self.scratch_block, dtype=torch.int64, device=dev
         )
-        segment_lens = [1] * T
+        segment_lens = [v] * size
 
         def callable_() -> torch.Tensor:
             return self.model.forward_hidden(
@@ -168,7 +176,7 @@ class CudaGraphRunner:
             if self._pool is None:
                 self._pool = graph.pool()
             return DecodeGraphTier(
-                size=T, graph=graph, input_ids=input_ids, positions=positions,
+                size=size, graph=graph, input_ids=input_ids, positions=positions,
                 seq_ids=seq_ids, block_tables=block_tables, hidden=hidden,
             )
         finally:
@@ -199,28 +207,34 @@ class CudaGraphRunner:
 
     def replay(
         self,
-        tokens: list[int],  # 真实 decode 行的输入 token（长度 n）
-        positions: list[int],  # 真实行的绝对位置
-        block_rows: list[list[int]],  # 真实行的 block 表
+        tokens: list[list[int]],  # 每个 seq 的 tokens_per_seq 行输入 token
+        positions: list[list[int]],  # 每个 seq 的 tokens_per_seq 行绝对位置
+        block_rows: list[list[int]],  # 每个 seq 的 block 表
     ) -> torch.Tensor:
-        """原地写输入 → 回放 → hidden [T, H]（前 n 行为真实结果）。
+        """原地写输入 → 回放 → hidden [size×v, H]（真实 seq 行在前）。
 
-        2026-11-23 评审 #1（高危）：padding 行的 block_tables 必须在**每次**
-        回放时重置为 scratch——否则上一次同档位更大 n 的真实块表残留，
-        store_paged_kv 对全部 T 行写入 → 垃圾 latent 落入活跃 seq 的
-        KV 位置（批收缩即触发，服务稳态频繁发生）。
+        token/position 按**每 seq 的行列表**传入（v=1 时退化为原单 token
+        语义）。padding seq 的块表每次回放重置为 scratch——否则上一次同档位
+        更大 n 的真实块表残留，store_paged_kv 对全部行写入 → 垃圾 latent
+        落入活跃 seq 的 KV 位置（批收缩即触发，服务稳态频繁发生）。
         """
         n = len(tokens)
+        v = self.tokens_per_seq
         assert n <= self.max_batch_size
+        assert len(positions) == n and all(len(row) == v for row in tokens)
+        assert all(len(row) == v for row in positions)
         tier = self._select(n)
         dev = self.device
-        tier.input_ids[:n].copy_(torch.tensor(tokens, dtype=torch.int64))
-        tier.positions[:n].copy_(torch.tensor(positions, dtype=torch.int64))
+        T_real = n * v
+        flat_tokens = [t for row in tokens for t in row]
+        flat_positions = [p for row in positions for p in row]
+        tier.input_ids[:T_real].copy_(torch.tensor(flat_tokens, dtype=torch.int64))
+        tier.positions[:T_real].copy_(torch.tensor(flat_positions, dtype=torch.int64))
         bt = torch.zeros(n, self.max_bt, dtype=torch.int64)
         for i, row in enumerate(block_rows):
             bt[i, : len(row)] = torch.as_tensor(row, dtype=torch.int64)
         tier.block_tables[:n].copy_(bt.to(dev))
-        # 高危修复：重置 padding 行的块表指向 scratch（μs 级 fill kernel）
+        # 高危修复：重置 padding seq 的块表指向 scratch（μs 级 fill kernel）
         if n < tier.size:
             tier.block_tables[n:].fill_(self.scratch_block)
         tier.graph.replay()

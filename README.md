@@ -9,13 +9,17 @@
 - 同步序引擎步（schedule → prepare → forward → sample → commit；
   ZOS 零开销异步三段式为后置增强——需 GPU 侧 token 喂数落地）
 - MTP 投机解码 + 置信度调度变长验证（采样式拒绝采样，累乘接受率 + 性能曲线定预算）
+- n-gram / prompt-lookup **无 draft 模型投机解码**（V2-Lite 无 nextn 权重时的
+  零训练路径；one-hot 稀疏草案 + 序列历史后缀匹配，与 MTP 共用验证/回滚）
 - 确定性采样（RNG 种子 = f(seq_seed, token 绝对位置, 用途流)）+ 同批形状
   重放 bit 级一致；**跨批形状 bit 级一致为 DeepInfer 级目标**（当前前向
   的 MoE 分桶/注意力分块对批形状敏感，见 test_batch_invariance 的 xfail）
 - 结构化输出（xgrammar：regex / JSON schema / EBNF，异步编译 + 失败隔离）
 - CUDA Graph（按 batch 档位分档、全档共享 memory pool；真实 V2-Lite 已验证）
 - MoE 专家并行 EP + EPLB（代码就绪，**多卡联调为后置项**；单卡路径已验收）
-- FP8 权重加载期反量化（在线 fp8 GEMM 与 FP8 KV cache 为后置项）
+- FP8 权重加载期反量化（在线 fp8 GEMM 为后置项）
+- FP8 KV cache（`--kv-cache-dtype fp8`：latent c FP8 + rope bf16 + 每 token
+  scale，KV 字节/token/层 1152 → 656（每 128 维一组 scale），DeepSeek-V3 生产同构）
 - OpenAI 兼容 HTTP 服务 + 离线 LLM API（真实模型 serving 已验收）
 
 ## 支持模型

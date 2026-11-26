@@ -63,6 +63,14 @@ class _EnvNamespace:
     #: (DeepInfer: DEEPINFER_ENABLE_MTP_VARLEN). Mutually exclusive with
     #: BATCH_INVARIANT, as in DeepInfer.
     ENABLE_MTP_VARLEN = _EnvDescriptor("CASCADE_ENABLE_MTP_VARLEN", int, 0)
+    #: n-gram/prompt-lookup 无 draft 模型投机解码（V2-Lite 无 nextn 权重的
+    #: 唯一零训练 SD 路径；1 = 引擎自动注入 NGramDraftModel）
+    NGRAM_DRAFT = _EnvDescriptor("CASCADE_NGRAM_DRAFT", int, 0)
+    #: 最短/最长匹配 gram（2/4 是 prompt-lookup 常用区间）
+    NGRAM_MIN_GRAM = _EnvDescriptor("CASCADE_NGRAM_MIN_GRAM", int, 2)
+    NGRAM_MAX_GRAM = _EnvDescriptor("CASCADE_NGRAM_MAX_GRAM", int, 4)
+    #: 单次最多草案 token 数（nextn_draft_tokens 为 0 时作为验证长度 K）
+    NGRAM_MAX_DRAFT = _EnvDescriptor("CASCADE_NGRAM_MAX_DRAFT", int, 4)
 
     # --- ZOS --------------------------------------------------------------------
     #: zero-overhead scheduling: overlap CPU batch scheduling with device
@@ -78,6 +86,8 @@ class _EnvNamespace:
     CUDAGRAPH_NUM_SPLITS = _EnvDescriptor("CASCADE_CUDAGRAPH_NUM_SPLITS", int, 8)
 
     # --- misc -------------------------------------------------------------------
+    #: KV cache 精度：bf16（默认）| fp8（latent c FP8 + rope bf16 + 每 token scale）
+    KV_DTYPE = _EnvDescriptor("CASCADE_KV_DTYPE", str, "bf16")
     #: 强制 Triton 算子全部走 PyTorch 参考路径（新架构 Triton 编译异常时的
     #: 逃生门；慢，但保证引擎可运行。图捕获需同时关 CASCADE_CUDAGRAPH）。
     DISABLE_TRITON = _EnvDescriptor("CASCADE_DISABLE_TRITON", int, 0)

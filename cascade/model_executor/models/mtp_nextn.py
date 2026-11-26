@@ -99,6 +99,9 @@ class MockDraftModel(nn.Module):
         last_token: torch.Tensor,
         start_positions: torch.Tensor,
         k: int,
+        *,
+        context_tokens: list[list[int]] | None = None,
+        request_ids: list[str] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         from cascade.sampling.rng import derive_uniform
 

@@ -182,19 +182,33 @@ class MLAAttention(nn.Module):
         )
 
         T = q_nope.shape[0]
-        kv = cache.layer_view(self.layer_idx)
+        kv, kv_rope, kv_scale = cache.layer_views(self.layer_idx)
         # q 吸收 W_UK：q_abs 与 latent c 点积（fp32 计算）
         q_abs = torch.einsum("thd,hdk->thk", q_nope.float(), self.u_k.float())
-        q_full = torch.cat((q_abs, q_rope.float()), dim=-1).to(kv.dtype)  # [T, h, 576]
+        # 模型 dtype（bf16）——fp8 KV 时 kv.dtype 是 float8，不能用于 q
+        q_full = torch.cat((q_abs, q_rope.float()), dim=-1).to(cache.dtype)  # [T, h, 576]
         all_decode = all(n == 1 for n in segment_lens)
+        # 图捕获安全：**全部段等长 v>1**（投机验证批：每 seq 1+K 行）时走
+        # 张量化元数据路径（无 .item()）——CUDA graph 多 token 回放依赖它。
+        uniform_v = segment_lens[0] if segment_lens and all(
+            n == segment_lens[0] for n in segment_lens
+        ) else 0
         out_latent = torch.empty(T, self.num_heads, self.kv_lora, dtype=torch.float32, device=kv.device)
         if all_decode:
             # ---- 纯 decode 批：图捕获安全（无 .item()）----
             seqlens = positions.to(torch.int64) + 1
             out_d = paged_mla_decode_attn(
-                q_full, kv, block_tables, seqlens, self.scale, self.kv_lora, num_splits=num_splits
+                q_full, kv, block_tables, seqlens, self.scale, self.kv_lora,
+                num_splits=num_splits, rope=kv_rope, kv_scale=kv_scale,
             )
             out_latent = out_d.to(torch.float32)
+        elif uniform_v > 1:
+            # ---- 等长多 token 批（MTP/n-gram 验证行）：图捕获安全 ----
+            seqlens = positions[::uniform_v] + uniform_v
+            out_latent = paged_mla_prefill_attn(
+                q_full, kv, block_tables, seqlens, [], self.scale, self.kv_lora,
+                uniform_v=uniform_v, rope=kv_rope, kv_scale=kv_scale,
+            )
         else:
             # ---- 混合批（eager）：段偏移与每段 KV 上界 ----
             offsets = []
@@ -220,7 +234,8 @@ class MLAAttention(nn.Module):
                 )
                 q_m = q_full.index_select(0, rows).contiguous()
                 out_latent[rows] = paged_mla_prefill_attn(
-                    q_m, kv, block_tables, seqlens, multi_segs, self.scale, self.kv_lora
+                    q_m, kv, block_tables, seqlens, multi_segs, self.scale, self.kv_lora,
+                    rope=kv_rope, kv_scale=kv_scale,
                 )
             # 单 token 段（decode）：split-K kernel
             decode_segs = [i for i, n in enumerate(segment_lens) if n == 1]
@@ -230,12 +245,13 @@ class MLAAttention(nn.Module):
                 bt_d = block_tables.index_select(0, torch.tensor(decode_segs, device=kv.device))
                 sl_d = seqlens.index_select(0, torch.tensor(decode_segs, device=kv.device))
                 out_d = paged_mla_decode_attn(
-                    q_d, kv, bt_d, sl_d, self.scale, self.kv_lora, num_splits=num_splits
+                    q_d, kv, bt_d, sl_d, self.scale, self.kv_lora,
+                    num_splits=num_splits, rope=kv_rope, kv_scale=kv_scale,
                 )
                 out_latent[rows] = out_d.to(torch.float32)
         # W_UV 上投影
         out = torch.einsum("thk,hdk->thd", out_latent, self.u_v.float())  # [T, h, 128] fp32
-        return out.to(kv.dtype).reshape(T, self.num_heads * self.v_head)
+        return out.to(cache.dtype).reshape(T, self.num_heads * self.v_head)
 
     # ------------------------------------------------------------------ explicit (HF oracle)
 

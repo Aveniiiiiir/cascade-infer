@@ -150,3 +150,54 @@ def test_accept_probs_track_empirical() -> None:
     ap = _accept_prob(q, torch.log(p))
     theoretical = float(torch.minimum(q, p).sum().item())
     assert abs(ap - theoretical) < 0.05, f"accept_prob {ap:.3f} vs Σmin {theoretical:.3f}"
+
+
+def test_sparse_onehot_all_accepted_bonus() -> None:
+    """n-gram 稀疏草案（one-hot p=1）：与目标 argmax 一致 → 全接受 + bonus。"""
+    torch.manual_seed(8)
+    K = 3
+    logits = _make_target(21, K + 1)
+    greedy = [int(l.argmax().item()) for l in logits]
+    target_lp = torch.stack([_greedy_onehot_lp(g) for g in greedy])
+    drafts = greedy[:K]
+    res = mtp_verify(
+        target_lp, None, torch.tensor(drafts),
+        torch.full((K,), 0.5), torch.full((K + 1,), 0.5),
+        draft_token_probs=torch.ones(K),
+    )
+    assert res.committed == drafts + [greedy[K]]
+    assert res.n_accepted_drafts == K
+    assert all(abs(p - 1.0) < 1e-6 for p in res.accept_probs)
+
+
+def test_sparse_wrong_draft_rejected() -> None:
+    """稀疏草案与目标 argmax 不符 → 拒绝 → 残差 argmax = 目标 argmax。"""
+    torch.manual_seed(9)
+    K = 2
+    logits = _make_target(22, K + 1)
+    greedy = [int(l.argmax().item()) for l in logits]
+    target_lp = torch.stack([_greedy_onehot_lp(g) for g in greedy])
+    wrong = [(greedy[0] + 1) % V, (greedy[1] + 2) % V]
+    res = mtp_verify(
+        target_lp, None, torch.tensor(wrong),
+        torch.full((K,), 0.5), torch.full((K + 1,), 0.5),
+        draft_token_probs=torch.ones(K),
+    )
+    assert res.committed == [greedy[0]]
+    assert res.n_accepted_drafts == 0
+
+
+def test_sparse_sentinel_fresh() -> None:
+    """稀疏路径的 -1 哨兵（n-gram 未命中）→ 强制拒绝、普通采样。"""
+    torch.manual_seed(10)
+    K = 3
+    logits = _make_target(23, K + 1)
+    target_lp = torch.stack([_greedy_onehot_lp(int(l.argmax().item())) for l in logits])
+    res = mtp_verify(
+        target_lp, None, torch.tensor([-1, -1, -1]),
+        torch.zeros(K), torch.full((K + 1,), 0.5),
+        draft_token_probs=torch.zeros(K),  # 哨兵概率 0（未命中）
+    )
+    assert res.committed == [int(logits[0].argmax().item())]
+    assert res.n_accepted_drafts == 0
+    assert res.accept_probs == [1.0]

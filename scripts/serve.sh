@@ -21,11 +21,22 @@ MAX_SEQS="${MAX_SEQS:-32}"
 API_KEY="${API_KEY:-}"
 LOG="${LOG:-/root/cascade_server.log}"
 PIDFILE="${PIDFILE:-/root/cascade_server.pid}"
+PYTHON="${PYTHON:-}"
+if [ -z "$PYTHON" ]; then
+  if command -v python >/dev/null 2>&1; then
+    PYTHON=python
+  elif [ -x /root/miniconda3/bin/python ]; then
+    PYTHON=/root/miniconda3/bin/python
+  else
+    PYTHON=python3
+  fi
+fi
 
 args=(--model "$CASCADE_MODEL" --port "$PORT" --max-model-len "$MAX_LEN" --max-num-seqs "$MAX_SEQS")
 [ -n "$API_KEY" ] && args+=(--api-key "$API_KEY")
+[ -n "${KV_DTYPE:-}" ] && args+=(--kv-cache-dtype "$KV_DTYPE")
 
-setsid nohup python -m cascade.entrypoints.http.server "${args[@]}" \
+setsid nohup "$PYTHON" -m cascade.entrypoints.http.server "${args[@]}" \
   > "$LOG" 2>&1 < /dev/null &
 echo $! > "$PIDFILE"
 

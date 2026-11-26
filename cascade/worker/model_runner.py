@@ -42,11 +42,18 @@ class ForwardBatch:
 
 @dataclass(slots=True)
 class DraftInfo:
-    """上一轮草案（step N 的 sample 阶段发射，step N+1 消费）。"""
+    """上一轮草案（step N 的 sample 阶段发射，step N+1 消费）。
 
-    tokens: list[int]  # [K] CPU（forward 输入组装 + 验证）
-    logprobs: torch.Tensor  # [K, V] fp32 GPU（验证的 draft 分布）
+    两种草案分布：
+    - 全量（MTP nextn）：``logprobs`` [K, V] fp32，token_probs=None
+    - 稀疏（n-gram）：``logprobs=None``，``token_probs`` [K]（one-hot 概率，
+      1.0=命中 / 0.0=哨兵）
+    """
+
+    tokens: list[int]  # [K] CPU（forward 输入组装 + 验证；-1 = fresh 哨兵）
+    logprobs: torch.Tensor | None  # [K, V] fp32 GPU（稀疏草案为 None）
     p_top1: list[float]  # [K]（置信度校准输入）
+    token_probs: list[float] | None = None  # [K]（稀疏草案的单点概率）
 
 
 @dataclass(slots=True)
@@ -163,7 +170,7 @@ class ModelRunner:
         else:
             activation_headroom = 0  # CPU 测试无 GPU 激活竞争
         budget = max(0, budget - rope_reserve - activation_headroom)
-        n = derive_num_blocks(budget, self.cfg, cache_cfg.block_size)
+        n = derive_num_blocks(budget, self.cfg, cache_cfg.block_size, dtype=cache_cfg.kv_dtype)
         # 实际需求上界：所有并发 seq 的 KV 足迹（含投机余量）
         max_useful = (
             self.engine_cfg.scheduler.max_num_seqs
@@ -204,8 +211,13 @@ class ModelRunner:
                         # 2026-11-18 审计 #6(c)：varlen 的验证长度 v ∈ (1, 1+K]
                         # ——草案按 K 发射，必须截断到 num_new_tokens−1，
                         # 否则 input_ids 与 positions/seq_ids 形状失配
-                        # （吸收路径 assert 崩 / 显式路径广播错位）
-                        rest = list(draft.tokens)[: s.num_new_tokens - 1]
+                        # （吸收路径 assert 崩 / 显式路径广播错位）。
+                        # 负值（n-gram 未命中哨兵）在输入侧映射为 0 ——
+                        # 其 KV 是垃圾，验证在哨兵处强拒后随回滚释放。
+                        rest = [
+                            (t if t >= 0 else 0)
+                            for t in list(draft.tokens)[: s.num_new_tokens - 1]
+                        ]
                         rest += [0] * (s.num_new_tokens - 1 - len(rest))
                     else:
                         rest = [0] * (s.num_new_tokens - 1)
@@ -338,18 +350,51 @@ class ModelRunner:
             m.status = -1
 
     @staticmethod
-    def decode_batch_meta(n: int) -> ForwardBatch:
+    def decode_batch_meta(n: int, seg_len: int = 1) -> ForwardBatch:
         """纯 decode 批的采样元数据（launch_sample 只读 sample_flags /
-        segment_offsets / segment_lens 三个字段；CUDA graph 路径使用）。"""
+        segment_offsets / segment_lens 三个字段；CUDA graph 路径使用）。
+
+        ``seg_len`` = 每 seq 的验证行数（1 = 普通 decode；1+K = 投机验证）。
+        """
         return ForwardBatch(
             input_ids=None,  # type: ignore[arg-type]
             positions=None,  # type: ignore[arg-type]
             seq_ids=None,  # type: ignore[arg-type]
-            segment_lens=[1] * n,
+            segment_lens=[seg_len] * n,
             block_tables=None,  # type: ignore[arg-type]
             sample_flags=[True] * n,
-            segment_offsets=list(range(n)),
+            segment_offsets=list(range(0, n * seg_len, seg_len)),
         )
+
+    def graph_inputs(
+        self, sched_out: SchedulerOutput, seg_len: int
+    ) -> tuple[list[list[int]], list[list[int]], list[list[int]]]:
+        """多 token 图回放的逐行输入（与 prepare_batch 同语义）。
+
+        调用方保证：全部为 decode 行且 ``num_new_tokens == seg_len``。
+        与 prepare_batch 的唯一差别是每行被显式展开成 Python 列表
+        （图 runner 需要整体写入持久缓冲，而不是拼一个扁平张量）。
+        """
+        all_tokens: list[list[int]] = []
+        all_positions: list[list[int]] = []
+        all_blocks: list[list[int]] = []
+        for s in sched_out.scheduled:
+            assert not s.is_prefill and s.num_new_tokens == seg_len
+            seq = s.seq
+            start = seq.num_tokens_computed - seg_len
+            first = seq.token_at(start)
+            rest: list[int] = []
+            if seg_len > 1:
+                draft = self._mtp_drafts.get(seq.request_id)
+                if draft is not None:
+                    rest = [
+                        (t if t >= 0 else 0) for t in list(draft.tokens)[: seg_len - 1]
+                    ]
+                rest += [0] * (seg_len - 1 - len(rest))
+            all_tokens.append([first, *rest])
+            all_positions.append(list(range(start, start + seg_len)))
+            all_blocks.append(seq.block_table)
+        return all_tokens, all_positions, all_blocks
 
     def launch_sample(
         self,
@@ -467,6 +512,8 @@ class ModelRunner:
         draft = self._mtp_drafts.pop(seq.request_id, None)
         P = seq.num_tokens - 1  # 输入首行（已提交末 token）的绝对位置
         dev = logits.device
+        sparse_probs: torch.Tensor | None = None
+        d_lp: torch.Tensor | None = None
         if draft is not None and K_actual > 0 and len(draft.tokens) >= K_actual:
             # 2026-11-18 审计 #6(d)：varlen 的 v ∈ (1, 1+K] 时草案按前缀
             # 截断到 K_actual——旧代码要求 len == K_actual 精确相等，
@@ -474,7 +521,14 @@ class ModelRunner:
             # 1 token，MTP 零收益）
             d_list = list(draft.tokens[:K_actual])
             d_tokens = torch.tensor(d_list, dtype=torch.int64, device=dev)
-            d_lp = draft.logprobs[:K_actual]
+            if draft.logprobs is not None:
+                d_lp = draft.logprobs[:K_actual]
+            else:
+                # 稀疏草案（n-gram）：one-hot 单点分布，不分配 [K, V]
+                assert draft.token_probs is not None
+                sparse_probs = torch.tensor(
+                    draft.token_probs[:K_actual], dtype=torch.float32, device=dev
+                )
         else:
             d_tokens = torch.full((K_actual,), -1, dtype=torch.int64, device=dev)
             d_lp = torch.zeros(K_actual, logits.shape[-1], dtype=torch.float32, device=dev)
@@ -552,13 +606,18 @@ class ModelRunner:
             [derive_uniform(seq_seed, P + j + 1, CASE_SAMPLE) for j in range(K_actual + 1)],
             dtype=torch.float32,
         )
-        res = mtp_verify(lp, d_lp, d_tokens, accept_u, sample_u)
+        res = mtp_verify(lp, d_lp, d_tokens, accept_u, sample_u, draft_token_probs=sparse_probs)
         # 置信度校准 + varlen 接受率回灌（2026-11-18 审计 #6(a)/(e)）：
         # 仅真实草案行——fresh/哨兵行的 accept_probs 恒 [1.0]，回灌会把
         # rates 抬到虚高（varlen 计划系统性乐观）、污染校准器 EMA。
-        if d_list is not None:
+        # 稀疏草案（n-gram）不喂校准器（p_top1 恒 1.0，无信息量）；
+        # 全哨兵（本轮无命中）也不回灌，避免把 varlen 率抬回 1.0。
+        if d_list is not None and any(t >= 0 for t in d_list):
             self._mtp_accept_feed[seq.request_id] = list(res.accept_probs)
-            self.calibrator.update_batch(draft.p_top1[: len(res.accept_probs)], res.accept_probs)
+            if d_lp is not None and draft is not None:
+                self.calibrator.update_batch(
+                    draft.p_top1[: len(res.accept_probs)], res.accept_probs
+                )
         return res.committed
 
     def drain_mtp_accept_feed(self) -> list[tuple[str, list[float]]]:
@@ -569,29 +628,57 @@ class ModelRunner:
 
     def _launch_drafts(self, sched_out: SchedulerOutput, mtp_tokens: dict[str, list[int]]) -> None:
         """为下一步发射草案：输入 = 本步提交的末 token（同步验证模式下
-        已在 CPU）。prefill 收尾的 seq 首个 decode 步无草案（fresh 行）。"""
+        已在 CPU）。prefill 收尾的 seq 首个 decode 步无草案（fresh 行）。
+
+        草案模型两类：
+        - 全量分布（MTP nextn）→ DraftInfo.logprobs [K, V]
+        - 稀疏分布（n-gram）→ DraftInfo.token_probs [K]（需要序列上下文：
+          prompt‖已生成‖本步已提交——无状态实现，抢占/重算后无需清理）
+        """
         new_drafts: dict[str, DraftInfo] = {}
         K = self.engine_cfg.scheduler.nextn_draft_tokens
         dev = self.device
+        targets: list[tuple[str, object, list[int]]] = []
         for s in sched_out.scheduled:
             if s.is_prefill:
                 continue
             committed = mtp_tokens.get(s.seq.request_id)
             if not committed:
                 continue  # 验证未产出（不应发生）或本轮无该 seq 结果
-            last_token = committed[-1]
-            start_pos = s.seq.num_tokens - 1 + len(committed)  # 末 token 绝对位置
-            tokens, logprobs, p_top1 = self.draft_model.draft_tokens(
-                last_hidden=None,
-                last_token=torch.tensor([last_token], dtype=torch.int64, device=dev),
-                start_positions=torch.tensor([start_pos], dtype=torch.int64, device=dev),
-                k=K,
-            )
-            new_drafts[s.seq.request_id] = DraftInfo(
-                tokens=[int(t) for t in tokens[0].tolist()],
-                logprobs=logprobs[0],
-                p_top1=[float(x) for x in p_top1[0].tolist()],
-            )
+            targets.append((s.seq.request_id, s.seq, committed))
+        if not targets:
+            self._mtp_drafts = {}  # 旧条目整体淘汰（含已结束/被抢占 seq）
+            return
+        last_tokens = [c[-1] for _, _, c in targets]
+        start_positions = [seq.num_tokens - 1 + len(c) for _, seq, c in targets]
+        contexts = [
+            list(seq.prompt_token_ids) + list(seq.output_token_ids) + list(c)
+            for _, seq, c in targets
+        ]
+        tokens, logprobs, p_top1 = self.draft_model.draft_tokens(
+            last_hidden=None,
+            last_token=torch.tensor(last_tokens, dtype=torch.int64, device=dev),
+            start_positions=torch.tensor(start_positions, dtype=torch.int64, device=dev),
+            k=K,
+            context_tokens=contexts,
+            request_ids=[rid for rid, _, _ in targets],
+        )
+        for i, (rid, _seq, _committed) in enumerate(targets):
+            if logprobs is None:
+                # 稀疏草案：tokens/probs 为 Python 列表（-1 哨兵 = 未命中）
+                probs = [float(x) for x in p_top1[i]]
+                new_drafts[rid] = DraftInfo(
+                    tokens=[int(t) for t in tokens[i]],
+                    logprobs=None,
+                    p_top1=probs,
+                    token_probs=probs,
+                )
+            else:
+                new_drafts[rid] = DraftInfo(
+                    tokens=[int(t) for t in tokens[i].tolist()],
+                    logprobs=logprobs[i],
+                    p_top1=[float(x) for x in p_top1[i].tolist()],
+                )
         self._mtp_drafts = new_drafts  # 旧条目整体淘汰（含已结束/被抢占 seq）
 
 

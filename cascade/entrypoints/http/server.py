@@ -589,6 +589,12 @@ def main() -> None:
     parser.add_argument("--max-model-len", type=int, default=None)
     parser.add_argument("--max-num-seqs", type=int, default=64)
     parser.add_argument(
+        "--kv-cache-dtype",
+        default=None,
+        choices=["bf16", "fp8"],
+        help="KV cache 精度：bf16（默认）| fp8（c 存 FP8 + rope bf16 + 每 token scale）",
+    )
+    parser.add_argument(
         "--api-key",
         default=None,
         help="可选 Bearer token；对外暴露时务必设置（默认 0.0.0.0 假设内网部署）",
@@ -600,6 +606,7 @@ def main() -> None:
         args.model,
         max_model_len=args.max_model_len,
         max_num_seqs=args.max_num_seqs,
+        kv_cache_dtype=args.kv_cache_dtype,
     )
     app = create_app(llm, api_key=args.api_key)
     uvicorn.run(app, host=args.host, port=args.port)

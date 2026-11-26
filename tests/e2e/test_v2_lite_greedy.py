@@ -160,7 +160,12 @@ def _cascade_teacher_forcing(
             bs = 64
             nbt = (T + bs - 1) // bs
             cache = CacheEngine(
-                cfg, CacheConfig(block_size=64), num_blocks=max(64, nbt),
+                cfg,
+                CacheConfig(
+                    block_size=64,
+                    kv_dtype=os.environ.get("CASCADE_KV_DTYPE", "bf16"),
+                ),
+                num_blocks=max(64, nbt),
                 device="cuda", dtype=_torch.bfloat16,
             )
             bt = _torch.zeros(1, max(nbt, 1), dtype=_torch.long, device="cuda")
