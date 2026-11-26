@@ -19,7 +19,7 @@ from cascade.model_executor.models.deepseek_v2 import DeepseekV2ForCausalLM
 class _StubTokenizer:
     """极简 tokenizer：char ↔ token id 往返（服务器路径验证足够）。"""
 
-    def encode(self, text: str) -> list[int]:
+    def encode(self, text: str, add_special_tokens: bool = True) -> list[int]:
         return [ord(c) % 400 + 1 for c in text]
 
     def decode(self, ids: list[int]) -> str:

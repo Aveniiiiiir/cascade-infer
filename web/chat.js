@@ -29,6 +29,29 @@
     lastStats: "",
   };
 
+  /* ---------------- side drawer: 3s idle auto-collapse ---------------- */
+  const sideToggle = $("#sideToggle");
+  let sideOpen = false;
+  let sideTimer = 0;
+  function setSide(open) {
+    sideOpen = open;
+    document.body.classList.toggle("side-open", open);
+    sideToggle.setAttribute("aria-expanded", String(open));
+    sideToggle.textContent = open ? "收起" : "参数";
+    clearTimeout(sideTimer);
+    if (open) sideTimer = setTimeout(() => setSide(false), 3000);
+  }
+  const pokeSide = () => {
+    if (!sideOpen) return;
+    clearTimeout(sideTimer);
+    sideTimer = setTimeout(() => setSide(false), 3000);
+  };
+  ["mousemove", "mousedown", "keydown", "wheel", "touchstart", "scroll"].forEach((ev) =>
+    window.addEventListener(ev, pokeSide, { passive: true })
+  );
+  sideToggle.addEventListener("click", () => setSide(!sideOpen));
+  setSide(true);
+
   /* ---------------- settings ---------------- */
   const saved = (() => {
     try { return JSON.parse(localStorage.getItem("cascade-chat") || "{}"); }
@@ -169,9 +192,17 @@
         headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
         body: JSON.stringify({
           model: "cascade",
-          messages: state.messages,
+          messages: [
+            {
+              role: "system",
+              content:
+                "你是 Cascade 助手。请用中文直接回答用户的问题；不要续写对话、不要模拟用户，也不要输出 User: / Assistant: 这类角色标记。",
+            },
+            ...state.messages,
+          ],
           max_tokens: Number(els.max.value),
           temperature: Number(els.temp.value),
+          stop: ["User:", "Assistant:", "用户:", "助手:"],
           stream: true,
         }),
         signal: controller.signal,
@@ -209,6 +240,20 @@
             if (!ttft) ttft = performance.now() - t0;
             content += delta;
             chunks += 1;
+            // 基座模型可能续写角色标记；即使服务端 stop 失效也在这里截断。
+            const roleMarkers = ["User:", "Assistant:", "用户:", "助手:"];
+            let cut = -1;
+            for (const marker of roleMarkers) {
+              const at = content.indexOf(marker);
+              if (at >= 0) cut = cut < 0 ? at : Math.min(cut, at);
+            }
+            if (cut >= 0) {
+              content = content.slice(0, cut).trimEnd();
+              assistant.body.innerHTML = renderMarkdown(content);
+              controller.abort();
+              done = true;
+              break;
+            }
             assistant.body.innerHTML = renderMarkdown(content);
             scrollToBottom();
             const elapsed = (performance.now() - t0) / 1000;
@@ -221,6 +266,10 @@
       }
 
       assistant.wrap.classList.remove("pending");
+      for (const tail of ["\nUser", "\nAssistant", "\n用户", "\n助手"]) {
+        if (content.endsWith(tail)) content = content.slice(0, -tail.length).trimEnd();
+      }
+      assistant.body.innerHTML = renderMarkdown(content);
       if (!content.trim()) {
         assistant.body.innerHTML = '<div class="error-box">模型没有返回内容。</div>';
       } else {
@@ -267,13 +316,11 @@
 
   els.clear.addEventListener("click", clearChat);
 
-  els.messages.addEventListener("click", (e) => {
-    const btn = e.target.closest("button");
-    if (!btn) return;
-    if (btn.closest(".empty-chips, .suggest")) {
+  document.querySelectorAll(".suggest, .empty-chips button").forEach((btn) => {
+    btn.addEventListener("click", () => {
       els.input.value = btn.textContent.trim();
       send(els.input.value);
-    }
+    });
   });
 
   els.input.focus();

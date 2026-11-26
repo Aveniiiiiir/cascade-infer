@@ -344,7 +344,8 @@ def _stop_token_seqs(llm: LLM, stop: list[str] | None) -> list[tuple[int, ...]] 
     for s in stop:
         if not isinstance(s, str) or not s:
             return None
-        enc = llm.tokenizer.encode(s)
+        # stop 字符串同样不能带 BOS，否则永远无法匹配生成 token。
+        enc = llm.tokenizer.encode(s, add_special_tokens=False)
         if not enc:
             return None
         seqs.append(tuple(enc))

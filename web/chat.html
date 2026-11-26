@@ -16,6 +16,7 @@
     <span class="tag">对话</span>
   </a>
   <div class="chat-nav-actions">
+    <button class="ghost-btn" id="sideToggle" type="button" aria-controls="chatSide" aria-expanded="true">收起</button>
     <span class="conn"><i id="connDot"></i><span id="connText">连接中</span></span>
     <a class="nav-link" href="index.html">首页</a>
     <button class="ghost-btn" id="clearBtn" type="button">清空</button>
@@ -23,12 +24,12 @@
 </header>
 
 <main class="chat-layout">
-  <aside class="chat-side">
+  <aside class="chat-side" id="chatSide">
     <div class="side-block">
       <div class="side-label">模型</div>
       <div class="model-card">
         <b>DeepSeek-V2-Lite</b>
-        <span>MLA + MoE · bf16 · CUDA Graph</span>
+        <span>MLA + MoE · bf16 · CUDA Graph<br />基座模型（非 Chat）</span>
       </div>
     </div>
     <div class="side-block">

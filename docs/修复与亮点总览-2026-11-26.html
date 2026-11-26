@@ -252,6 +252,14 @@
         <td>ref 路径由 <code>seqlens−v</code> 还原 segments</td></tr>
       <tr><td><code>serve.sh</code> 非交互 SSH 启动失败</td><td>PATH 无 <code>python</code></td>
         <td>按 <code>PYTHON</code> → <code>python</code> → conda → <code>python3</code> 解析</td></tr>
+      <tr><td>Chat 模板双 BOS / stop 不生效</td><td><code>tokenizer.encode</code> 默认自动加 BOS</td>
+        <td>chat 模板与 stop 均改 <code>add_special_tokens=False</code></td></tr>
+      <tr><td>基座模型续写 <code>User:/Assistant:</code> 小剧场</td><td>基座 checkpoint + 无角色 stop</td>
+        <td>服务端 <code>finish=stop</code> + 前端角色标记截断</td></tr>
+      <tr><td>「试试」按钮无响应</td><td>监听只绑在消息区，未覆盖侧栏</td>
+        <td>监听 <code>.suggest</code> 与空态 chips</td></tr>
+      <tr><td>左侧栏不收起</td><td>无 idle 逻辑</td>
+        <td>3 秒无事件自动收起，按钮唤出</td></tr>
     </tbody>
   </table>
 
@@ -325,7 +333,7 @@
   <p>以下内容由 <code>scripts/build_docs_html.py</code> 从 <code>docs/*.md</code> 自动渲染，与源文件一致；点击标题展开，便于在这个页面里直接查阅全部报告。</p>
 <div class="doc-group" id="lib-opt"><h3>总览与优化 <span class="doc-count">2 篇</span></h3>
 <details class="doc" id="doc-修复与亮点总览-2026-11-26">
-  <summary><span class="doc-title">修复与亮点总览（截至 2026-11-26）</span><span class="doc-meta">5.8 KB · Markdown 原文</span></summary>
+  <summary><span class="doc-title">修复与亮点总览（截至 2026-11-26）</span><span class="doc-meta">6.4 KB · Markdown 原文</span></summary>
   <div class="doc-body">
 <h4>修复与亮点总览（截至 2026-11-26）</h4>
 <p>本文件汇总项目从审计到量产验收的关键 bug 修复与工程亮点，作为 <code>docs/</code> 历史报告的索引与最新一轮（n-gram / FP8 KV / 官网落地页）的归档。</p>
@@ -339,7 +347,7 @@
 <h6>精度迭代（真实模型 teacher-forcing）</h6>
 <table><thead><tr><th>版本</th><th>explicit 一致率</th><th>结论</th></tr></thead><tbody><tr><td>per-token 单 scale</td><td>627/640 = <strong>0.9797</strong></td><td>低于 0.985 门槛，放弃</td></tr><tr><td>每 128 维分组 scale</td><td>e2e <strong>PASS</strong>（<code>FP8B_EXIT=0</code>）</td><td>采用（V3 生产格式）</td></tr></tbody></table>
 <h6>4. 本轮捕获并修复的问题</h6>
-<table><thead><tr><th>问题</th><th>根因</th><th>修复</th></tr></thead><tbody><tr><td>FP8 KV 精度不达门槛</td><td>单 token 一个 absmax scale，outlier 通道误差大</td><td>改为每 128 维一组 scale</td></tr><tr><td>CUDA Graph 遇 MTP/n-gram 直接退化 eager</td><td>图只支持每 seq 1 行</td><td><code>tokens_per_seq=1+K</code> + <code>uniform_v</code> 图安全路径</td></tr><tr><td>n-gram 未命中 token 被当作真实草案</td><td>输入侧 0 填充 vs 验证侧 -1 哨兵语义不一致</td><td>输入侧负值映射 0，验证侧 -1 强拒</td></tr><tr><td>n-gram <code>max_draft &lt; 引擎 K</code> 时草案整体丢弃</td><td>返回长度不足 K，验证判为无草案</td><td>尾部补 -1 哨兵到 K</td></tr><tr><td>FP8 显式路径 CPU 测试崩溃</td><td><code>index_cpu not implemented for Float8_e4m3fn</code></td><td>int8 视图 gather 后转回 fp8</td></tr><tr><td><code>uniform_v</code> 在 ref 路径断言失败</td><td>参考实现只接受显式 segments</td><td>ref 路径由 <code>seqlens-v</code> 还原 segments</td></tr><tr><td><code>serve.sh</code> 在非交互 SSH 下启动失败</td><td>PATH 无 <code>python</code></td><td>按 <code>PYTHON</code> → <code>python</code> → conda → <code>python3</code> 解析</td></tr></tbody></table>
+<table><thead><tr><th>问题</th><th>根因</th><th>修复</th></tr></thead><tbody><tr><td>FP8 KV 精度不达门槛</td><td>单 token 一个 absmax scale，outlier 通道误差大</td><td>改为每 128 维一组 scale</td></tr><tr><td>CUDA Graph 遇 MTP/n-gram 直接退化 eager</td><td>图只支持每 seq 1 行</td><td><code>tokens_per_seq=1+K</code> + <code>uniform_v</code> 图安全路径</td></tr><tr><td>n-gram 未命中 token 被当作真实草案</td><td>输入侧 0 填充 vs 验证侧 -1 哨兵语义不一致</td><td>输入侧负值映射 0，验证侧 -1 强拒</td></tr><tr><td>n-gram <code>max_draft &lt; 引擎 K</code> 时草案整体丢弃</td><td>返回长度不足 K，验证判为无草案</td><td>尾部补 -1 哨兵到 K</td></tr><tr><td>FP8 显式路径 CPU 测试崩溃</td><td><code>index_cpu not implemented for Float8_e4m3fn</code></td><td>int8 视图 gather 后转回 fp8</td></tr><tr><td><code>uniform_v</code> 在 ref 路径断言失败</td><td>参考实现只接受显式 segments</td><td>ref 路径由 <code>seqlens-v</code> 还原 segments</td></tr><tr><td><code>serve.sh</code> 在非交互 SSH 下启动失败</td><td>PATH 无 <code>python</code></td><td>按 <code>PYTHON</code> → <code>python</code> → conda → <code>python3</code> 解析</td></tr><tr><td>Chat 模板出现双 BOS / stop 不生效</td><td><code>tokenizer.encode</code> 默认自动加 BOS</td><td>chat 模板与 stop 均改 <code>add_special_tokens=False</code></td></tr><tr><td>基座模型续写 <code>User:/Assistant:</code> 小剧场</td><td>基座 checkpoint + 无角色 stop</td><td>服务端 finish=stop + 前端角色标记截断</td></tr><tr><td>「试试」按钮无响应</td><td>事件监听只绑在消息区，未覆盖侧栏</td><td>监听 <code>.suggest</code> 与空态 chips</td></tr><tr><td>左侧栏不收起</td><td>无 idle 逻辑</td><td>3 秒无事件自动收起，按钮唤出</td></tr></tbody></table>
 <h6>5. 验证结果</h6>
 <table><thead><tr><th>层级</th><th>结果</th></tr></thead><tbody><tr><td>本机 <code>pytest tests/cpu</code></td><td>全绿</td></tr><tr><td><code>ruff check cascade scripts</code></td><td>全绿</td></tr><tr><td>集群 kernel/verify 24 项</td><td>全过</td></tr><tr><td>集群 <code>tests/{model,triton_ops,engine}</code></td><td><strong>140 passed / 9 skipped</strong></td></tr><tr><td>e2e n-gram（真实 V2-Lite，bf16 KV）</td><td><strong>PASS</strong></td></tr><tr><td>e2e FP8 KV（真实 V2-Lite，分组 scale）</td><td><strong>PASS</strong></td></tr></tbody></table>
 <h5>二、官网落地页（web/）</h5>
@@ -733,12 +741,12 @@ tests/e2e/test_v2_lite_greedy.py     | 69 +++++++++++++++++++++++-------------
   </div>
 </details>
 <details class="doc" id="doc-上线验收与部署-2026-11-26">
-  <summary><span class="doc-title">上线验收与部署（2026-11-26）</span><span class="doc-meta">4.9 KB · Markdown 原文</span></summary>
+  <summary><span class="doc-title">上线验收与部署（2026-11-26）</span><span class="doc-meta">5.4 KB · Markdown 原文</span></summary>
   <div class="doc-body">
 <h4>上线验收与部署（2026-11-26）</h4>
 <p>实例：<code>c4ae4b8669-a9956a39</code>（RTX 4080 SUPER 32GB，Ubuntu 22.04 容器） 验收代码：<code>feat/ngram-fp8-kv-web</code> @ <code>327b3b4</code>（release tree 精确归档部署） 运行环境：NVIDIA RTX 4080 SUPER · driver 595.71.05 · torch 2.7.0+cu128 · transformers 4.57.6</p>
 <h5>1. 验收结果</h5>
-<table><thead><tr><th>项</th><th>结果</th></tr></thead><tbody><tr><td>精确 release tree <code>acceptance_full.sh</code></td><td><strong>PASS（ACCEPTANCE FULL OK）</strong></td></tr><tr><td>CPU 测试</td><td>通过（acceptance 第一阶段）</td></tr><tr><td><code>tests/model + tests/triton_ops + tests/engine</code></td><td>通过（140 passed / 9 skipped 口径）</td></tr><tr><td><code>tests/e2e</code>（真实 V2-Lite）</td><td>通过（本轮日志）</td></tr><tr><td>CLI 冒烟</td><td>PASS（两个 prompt 均输出）</td></tr><tr><td>HTTP serving 冒烟</td><td>PASS（/v1/models 200、chat/completions 200）</td></tr><tr><td>生产门禁 <code>production_gate.sh</code></td><td><strong>PASS（GATE OK）</strong></td></tr><tr><td>8/16/32 并发压测</td><td><strong>PASS（0 errors）</strong></td></tr><tr><td>浏览器对话页 E2E</td><td><strong>PASS</strong>（SSE 254 chunks / TTFT 208ms）</td></tr></tbody></table>
+<table><thead><tr><th>项</th><th>结果</th></tr></thead><tbody><tr><td>精确 release tree <code>acceptance_full.sh</code></td><td><strong>PASS（ACCEPTANCE FULL OK）</strong></td></tr><tr><td>CPU 测试</td><td>通过（acceptance 第一阶段）</td></tr><tr><td><code>tests/model + tests/triton_ops + tests/engine</code></td><td>通过（140 passed / 9 skipped 口径）</td></tr><tr><td><code>tests/e2e</code>（真实 V2-Lite）</td><td>通过（本轮日志）</td></tr><tr><td>CLI 冒烟</td><td>PASS（两个 prompt 均输出）</td></tr><tr><td>HTTP serving 冒烟</td><td>PASS（/v1/models 200、chat/completions 200）</td></tr><tr><td>生产门禁 <code>production_gate.sh</code></td><td><strong>PASS（GATE OK）</strong></td></tr><tr><td>8/16/32 并发压测</td><td><strong>PASS（0 errors）</strong></td></tr><tr><td>浏览器对话页 E2E</td><td><strong>PASS</strong>（SSE 流式；无 <code>User:/Assistant:</code> 续写）</td></tr><tr><td>Chat 模板 / stop 修复</td><td><strong>PASS</strong>（单 BOS；stop 命中后 <code>finish=stop</code>）</td></tr></tbody></table>
 <h6>压测（<code>MAX_SEQS=24</code>，nginx :8080，SSE）</h6>
 <table><thead><tr><th>并发客户端</th><th>QPS</th><th>tokens/s</th><th>TTFT p50</th><th>TPOT p50</th></tr></thead><tbody><tr><td>8</td><td>7.45</td><td>223.6</td><td>223 ms</td><td>21.7 ms</td></tr><tr><td>16</td><td>15.62</td><td>468.5</td><td>250 ms</td><td>22.7 ms</td></tr><tr><td>32</td><td>11.81</td><td>354.3</td><td>2582 ms</td><td>27.8 ms</td></tr></tbody></table>
 <p>32 客户端全部成功，但活动序列上限 24，因此排队、TTFT 升高；峰值吞吐在 16 并发。 <code>MAX_SEQS=32</code> 在 32 活跃并发下实测 <code>torch.OutOfMemoryError</code>（服务进程占满 31.46GB）， 灰度配置已降为 24。</p>
@@ -763,7 +771,7 @@ GPU（V2-Lite bf16，MAX_LEN=4096，MAX_SEQS=24）</code></pre>
 <h5>5. 放量与回滚</h5>
 <ul><li>观察 5xx/判死率、TTFT/TPOT、tokens/s、GPU 显存、进程重启。</li><li>错误率 &gt;2% 持续 5 分钟：禁止放量；实例不可用 &gt;5 分钟：回滚。</li><li>GPU 显存 &gt;95% 持续 5 分钟：降低 <code>MAX_SEQS</code> 或回滚。</li><li>回滚使用上一 release tree 与 env 文件；保留 nginx 配置不变。</li></ul>
 <h5>6. 前端对话入口</h5>
-<ul><li>静态站部署到实例 <code>/opt/cascade-web</code>，nginx 8080 直接提供：<ul><li><code>/</code>：官网落地页</li><li><code>/chat.html</code>：对话页</li></ul></li><li>对话页同源调用 <code>/ui-api/v1/chat/completions</code>；nginx 仅允许 <code>127.0.0.1</code> 并把 API key 从 root-only 的 <code>/etc/cascade-infer/ui_auth.conf</code> 注入， 浏览器端不保存、不输入密钥。</li><li>Windows 双击项目根目录 <code>打开Cascade对话.bat</code>：建立免密 SSH 隧道 <code>18080 → 实例 8080</code> 并打开 <code>http://127.0.0.1:18080/chat.html</code>。 已为当前 Windows 用户安装 SSH public key，无需输入密码。</li><li><code>/v1/*</code> 保持客户端自带 Bearer key；生产门禁仍验证无 key 返回 401。</li></ul>
+<ul><li>静态站部署到实例 <code>/opt/cascade-web</code>，nginx 8080 直接提供：<ul><li><code>/</code>：官网落地页</li><li><code>/chat.html</code>：对话页</li></ul></li><li>对话页同源调用 <code>/ui-api/v1/chat/completions</code>；nginx 仅允许 <code>127.0.0.1</code> 并把 API key 从 root-only 的 <code>/etc/cascade-infer/ui_auth.conf</code> 注入， 浏览器端不保存、不输入密钥。</li><li>Windows 双击项目根目录 <code>打开Cascade对话.bat</code>：建立免密 SSH 隧道 <code>18080 → 实例 8080</code> 并打开 <code>http://127.0.0.1:18080/chat.html</code>。 已为当前 Windows 用户安装 SSH public key，无需输入密码。</li><li><code>/v1/*</code> 保持客户端自带 Bearer key；生产门禁仍验证无 key 返回 401。</li><li>修复：chat template 与 stop 字符串改为 <code>add_special_tokens=False</code>，避免 prompt 双 BOS、stop 带 BOS 永不命中；<code>stop</code> 命中后服务端返回 <code>finish=stop</code>。</li><li>交互：左侧参数栏 3 秒无事件自动收起，「参数」按钮唤出；「试试」与空态 快捷按钮已接上 send；基座模型若仍输出角色标记，前端会截断到第一次 <code>User:</code> / <code>Assistant:</code>。</li></ul>
 <h5>7. 已知限制</h5>
 <ul><li>单卡 32GB 仅适合灰度；正式业务建议 48GB。</li><li>FP8 KV 只省 KV，不减少 29.3GB 模型权重。</li><li>仅支持 DeepSeek-V2/V2-Lite；不支持 V3/R1。</li><li>公网 HTTPS/WAF/审计未包含在内，当前为内网灰度配置。</li></ul>
   </div>
@@ -799,6 +807,7 @@ GPU（V2-Lite bf16，MAX_LEN=4096，MAX_SEQS=24）</code></pre>
       <tr><td>acceptance_full.sh（精确 release tree）</td><td><span class="status ok" id="acc-full">PASS · ACCEPTANCE FULL OK</span></td><td>日志 <code>/root/acceptance-327b3b4.log</code></td></tr>
       <tr><td>CPU + model/triton_ops/engine 测试</td><td><span class="status ok">通过</span></td><td>140 passed / 9 skipped 口径</td></tr>
       <tr><td>e2e 真实 V2-Lite</td><td><span class="status ok">通过</span></td><td>含 teacher-forcing 与 free-running</td></tr>
+      <tr><td>浏览器对话页 E2E</td><td><span class="status ok">PASS</span></td><td>SSE 流式；无角色标记续写</td></tr>
       <tr><td>CLI 离线冒烟</td><td><span class="status ok" id="acc-cli">PASS</span></td><td>acceptance 最后阶段</td></tr>
       <tr><td>HTTP serving 冒烟</td><td><span class="status ok" id="acc-http">PASS · 200/200</span></td><td>acceptance 最后阶段</td></tr>
       <tr><td>生产门禁 production_gate.sh</td><td><span class="status ok" id="gate">PASS · GATE OK</span></td><td>鉴权 / 推理 / metrics / 反代</td></tr>

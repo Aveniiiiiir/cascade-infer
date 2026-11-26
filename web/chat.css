@@ -103,3 +103,21 @@ a{color:inherit;text-decoration:none}
 @media (prefers-reduced-motion:reduce){
   *{animation:none!important;transition:none!important;scroll-behavior:auto!important}
 }
+/* ---------------- collapsible side drawer ---------------- */
+.chat-page.side-open .chat-main{padding-left:266px}
+.chat-main{transition:padding-left .42s cubic-bezier(.22,.61,.36,1)}
+.chat-side{
+  position:fixed;top:62px;left:12px;bottom:16px;width:250px;z-index:30;
+  overflow:auto;border:1px solid var(--line);border-radius:16px;
+  background:rgba(9,13,22,.94);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);
+  box-shadow:0 24px 60px -30px rgba(0,0,0,.9);
+  transform:translateX(-120%);opacity:0;pointer-events:none;
+  transition:transform .42s cubic-bezier(.22,.61,.36,1),opacity .3s ease;
+}
+.chat-page.side-open .chat-side{transform:none;opacity:1;pointer-events:auto}
+#sideToggle{display:inline-flex}
+@media (max-width:760px){
+  .chat-page.side-open .chat-main{padding-left:0}
+  .chat-side{top:62px;left:12px;right:12px;width:auto;bottom:16px}
+  #sideToggle{display:inline-flex}
+}
