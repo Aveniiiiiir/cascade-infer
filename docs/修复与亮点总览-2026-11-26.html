@@ -733,7 +733,7 @@ tests/e2e/test_v2_lite_greedy.py     | 69 +++++++++++++++++++++++-------------
   </div>
 </details>
 <details class="doc" id="doc-上线验收与部署-2026-11-26">
-  <summary><span class="doc-title">上线验收与部署（2026-11-26）</span><span class="doc-meta">4.1 KB · Markdown 原文</span></summary>
+  <summary><span class="doc-title">上线验收与部署（2026-11-26）</span><span class="doc-meta">4.2 KB · Markdown 原文</span></summary>
   <div class="doc-body">
 <h4>上线验收与部署（2026-11-26）</h4>
 <p>实例：<code>c4ae4b8669-a9956a39</code>（RTX 4080 SUPER 32GB，Ubuntu 22.04 容器） 验收代码：<code>feat/ngram-fp8-kv-web</code> @ <code>327b3b4</code>（release tree 精确归档部署） 运行环境：NVIDIA RTX 4080 SUPER · driver 595.71.05 · torch 2.7.0+cu128 · transformers 4.57.6</p>
@@ -755,7 +755,7 @@ Cascade HTTP server（--host 127.0.0.1，API key 鉴权）
    ▼
 GPU（V2-Lite bf16，MAX_LEN=4096，MAX_SEQS=24）</code></pre>
 <h6>实际守护方式</h6>
-<p>该实例 PID 1 为 bash，由 <code>/bin/supervisord</code> 托管，<strong>没有可用的 systemd</strong>； 实际部署使用独立 supervisord 实例（<code>/etc/cascade-infer/supervisord.conf</code>）， systemd unit 仅提供给标准 Linux 主机。</p>
+<p>该实例 PID 1 为 bash，由 <code>/bin/supervisord</code> 托管，<strong>没有可用的 systemd</strong>； 实际部署使用独立 supervisord 实例（<code>/etc/cascade-infer/supervisord.conf</code>）， 同时守护 <code>cascade-infer</code> 与 <code>cascade-nginx</code>；systemd unit 仅提供给标准 Linux 主机。</p>
 <h5>3. 已生成并校验的配置</h5>
 <table><thead><tr><th>文件</th><th>状态</th></tr></thead><tbody><tr><td><code>deploy/systemd/cascade-infer.service</code></td><td>已提供；当前容器不可执行</td></tr><tr><td><code>deploy/supervisor/cascade-infer.conf</code></td><td>参考单程序配置</td></tr><tr><td><code>deploy/supervisord.conf</code></td><td><strong>实际部署</strong>：独立 socket/pid，autorestart</td></tr><tr><td><code>deploy/nginx/nginx.conf</code> + <code>deploy/nginx/cascade.conf</code></td><td><code>nginx -t</code> 通过</td></tr><tr><td><code>deploy/alerting/cascade.rules.yml</code></td><td>YAML 解析通过；需 Prometheus/Alertmanager</td></tr><tr><td><code>deploy/alerting/prometheus-scrape.example.yml</code></td><td>抓取示例（token 文件注入）</td></tr><tr><td><code>deploy/run_server.sh</code></td><td>读取 root-only env 后 exec</td></tr><tr><td><code>deploy/bootstrap.sh</code></td><td>启动 supervisor、等待就绪、启动 nginx</td></tr><tr><td><code>scripts/production_gate.sh</code></td><td>鉴权/推理/指标/反代门禁</td></tr><tr><td><code>scripts/load_test_suite.sh</code></td><td>8/16/32 并发 SSE 压测</td></tr></tbody></table>
 <h5>4. 灰度状态</h5>
@@ -782,8 +782,8 @@ GPU（V2-Lite bf16，MAX_LEN=4096，MAX_SEQS=24）</code></pre>
   <div class="cards">
     <div class="card"><b>验收版本</b><span><code>feat/ngram-fp8-kv-web</code> @ <code>327b3b4</code>，
       与 GitHub 分支一致。</span></div>
-    <div class="card"><b>部署方式</b><span>容器无 systemd（PID 1 为 bash），实际用独立
-      supervisord + nginx，systemd unit 已提供给标准主机。</span></div>
+    <div class="card"><b>部署方式</b><span>容器无 systemd（PID 1 为 bash），实际用独立 supervisord
+      同时守护 Cascade 与 nginx，systemd unit 已提供给标准主机。</span></div>
     <div class="card"><b>默认配置</b><span>bf16 KV、n-gram/FP8 关闭、MAX_LEN=4096、
       MAX_SEQS=24、服务只监听 127.0.0.1:8000。</span></div>
   </div>
@@ -817,7 +817,7 @@ GPU（V2-Lite bf16，MAX_LEN=4096，MAX_SEQS=24）</code></pre>
   <table>
     <thead><tr><th>文件</th><th>校验</th></tr></thead>
     <tbody>
-      <tr><td><code>deploy/supervisord.conf</code></td><td class="ok">实际部署；autorestart + 独立 socket/pid</td></tr>
+      <tr><td><code>deploy/supervisord.conf</code></td><td class="ok">实际部署：守护 Cascade + nginx，autorestart + 独立 socket/pid</td></tr>
       <tr><td><code>deploy/nginx/{nginx.conf,cascade.conf}</code></td><td class="ok">nginx -t 通过</td></tr>
       <tr><td><code>deploy/systemd/cascade-infer.service</code></td><td>已提供；当前容器无 systemd，不可启用</td></tr>
       <tr><td><code>deploy/alerting/cascade.rules.yml</code></td><td class="ok">YAML 解析通过；需 Prometheus/Alertmanager</td></tr>
